@@ -1,0 +1,1 @@
+{{ $node["Google Gemini Chat Model"].json["candidates"][0]["content"]["parts"][0]["text"] }}
