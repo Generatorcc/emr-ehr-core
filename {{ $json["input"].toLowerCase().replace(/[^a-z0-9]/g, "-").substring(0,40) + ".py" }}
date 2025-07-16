@@ -1,1 +1,446 @@
-{{ $node["Basic LLM Chain"].json["content"] }}
+```python
+# /config.py
+
+import os
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    """
+    Manages application settings and secrets.
+    Reads from environment variables for production deployment.
+    """
+    # Database Configuration
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/emr_db")
+
+    # JWT Security Configuration
+    # In production, use a secure, randomly generated key.
+    # openssl rand -hex 32
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    class Config:
+        case_sensitive = True
+
+settings = Settings()
+```
+
+```python
+# /database.py
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from .config import settings
+
+# Create a SQLAlchemy engine instance.
+# connect_args is for SQLite, but included for compatibility.
+# In production with PostgreSQL, pool_size and max_overflow can be tuned.
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True, # Checks connections for liveness before handout.
+    pool_recycle=3600    # Recycles connections after 1 hour.
+)
+
+# Each instance of the SessionLocal class will be a database session.
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Base class for declarative class definitions.
+Base = declarative_base()
+
+def get_db():
+    """
+    Dependency to get a database session for each request.
+    Ensures the session is always closed after the request.
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+```python
+# /models.py
+
+import uuid
+from sqlalchemy import Column, String, Date, DateTime, ForeignKey, Enum as SQLAlchemyEnum, JSON
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+import enum
+from .database import Base
+
+class UserRole(str, enum.Enum):
+    CLINICIAN = "clinician"
+    ADMIN = "admin"
+    PATIENT = "patient"
+    SYSTEM = "system"
+
+class AuditEventStatus(str, enum.Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+class Patient(Base):
+    """
+    Represents a patient record in the database.
+    PHI is stored here and must be handled with care.
+    """
+    __tablename__ = "patients"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    first_name = Column(String, nullable=False, index=True)
+    last_name = Column(String, nullable=False, index=True)
+    date_of_birth = Column(Date, nullable=False)
+    gender = Column(String(50))
+    contact_info = Column(JSON) # Encrypted at application level before storing if needed
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+class User(Base):
+    """
+    Represents an authenticated user of the system.
+    """
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    role = Column(SQLAlchemyEnum(UserRole), nullable=False)
+    is_active = Column(Boolean, default=True)
+
+class AuditLog(Base):
+    """
+    HIPAA-compliant audit log for all actions involving PHI access.
+    """
+    __tablename__ = "audit_logs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    performing_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    performing_user_ip = Column(String, nullable=False)
+    target_patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), nullable=True)
+    action = Column(String, nullable=False)
+    status = Column(SQLAlchemyEnum(AuditEventStatus), nullable=False)
+    details = Column(JSON) # e.g., error messages, accessed fields
+
+    user = relationship("User")
+    patient = relationship("Patient")
+```
+
+```python
+# /schemas.py
+
+import uuid
+from pydantic import BaseModel, Field
+from datetime import date, datetime
+from typing import Optional, List
+from .models import UserRole, AuditEventStatus
+
+# --- Token Schemas ---
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+    user_id: str
+    role: UserRole
+    scopes: List[str] = []
+
+# --- User Schemas ---
+class UserBase(BaseModel):
+    username: str
+    role: UserRole
+
+class UserInDB(UserBase):
+    id: uuid.UUID
+    is_active: bool
+
+    class Config:
+        orm_mode = True
+
+# --- Patient Schemas ---
+class PatientDemographicsResponse(BaseModel):
+    """
+    Represents the secure, minimal view of patient demographics.
+    This model adheres to the HIPAA Minimum Necessary Rule.
+    """
+    patient_id: uuid.UUID = Field(..., alias="id")
+    first_name: str
+    last_name: str
+    date_of_birth: date
+    gender: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+        allow_population_by_field_name = True
+
+# --- Audit Log Schemas ---
+class AuditLogCreate(BaseModel):
+    performing_user_id: uuid.UUID
+    performing_user_ip: str
+    target_patient_id: Optional[uuid.UUID] = None
+    action: str
+    status: AuditEventStatus
+    details: Optional[dict] = None
+```
+
+```python
+# /audit.py
+
+import uuid
+from sqlalchemy.orm import Session
+from . import models, schemas
+
+class AuditLogger:
+    """
+    Service for creating HIPAA-compliant audit log entries.
+    """
+    @staticmethod
+    def log(
+        db: Session,
+        *,
+        performing_user_id: uuid.UUID,
+        performing_user_ip: str,
+        action: str,
+        status: schemas.AuditEventStatus,
+        target_patient_id: Optional[uuid.UUID] = None,
+        details: Optional[dict] = None,
+    ):
+        """
+        Creates and commits an audit log entry to the database.
+        """
+        audit_entry_data = schemas.AuditLogCreate(
+            performing_user_id=performing_user_id,
+            performing_user_ip=performing_user_ip,
+            target_patient_id=target_patient_id,
+            action=action,
+            status=status,
+            details=details or {},
+        )
+        db_audit_log = models.AuditLog(**audit_entry_data.dict())
+        db.add(db_audit_log)
+        db.commit()
+
+audit_logger = AuditLogger()
+```
+
+```python
+# /crud.py
+
+import uuid
+from sqlalchemy.orm import Session
+from typing import Optional
+from . import models
+
+def get_patient_by_id(db: Session, patient_id: uuid.UUID) -> Optional[models.Patient]:
+    """
+    Retrieves a patient record by its UUID.
+    """
+    return db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+
+def get_user_by_username(db: Session, username: str) -> Optional[models.User]:
+    """
+    Retrieves a user record by their username. Used for authentication.
+    """
+    return db.query(models.User).filter(models.User.username == username).first()
+
+def check_user_patient_access(db: Session, user_id: uuid.UUID, patient_id: uuid.UUID) -> bool:
+    """
+    Checks if a user has a legitimate relationship with a patient.
+    This is a critical access control function for HIPAA compliance.
+    In a real system, this would query a complex authorization model,
+    e.g., patient-provider assignment tables, care teams, or consent flags.
+    For this example, we assume clinicians can access any patient.
+    """
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        return False
+    # Admins and clinicians have broad access for this example.
+    # In a real system, clinician access would be far more granular.
+    if user.role in [models.UserRole.ADMIN, models.UserRole.CLINICIAN]:
+        return True
+    return False # Default deny
+```
+
+```python
+# /auth.py
+
+from datetime import datetime, timedelta
+from typing import Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from sqlalchemy.orm import Session
+from passlib.context import CryptContext
+
+from .config import settings
+from . import schemas, models, crud, database
+
+# Password hashing context using bcrypt
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# OAuth2 scheme definition
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """
+    Generates a JWT access token.
+    """
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+def get_current_user(
+    db: Session = Depends(database.get_db), token: str = Depends(oauth2_scheme)
+) -> models.User:
+    """
+    Dependency to decode JWT and retrieve the current user.
+    Raises credentials exception if token is invalid or user not found.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: str = payload.get("sub")
+        user_id: str = payload.get("user_id")
+        if username is None or user_id is None:
+            raise credentials_exception
+        token_data = schemas.TokenData(username=username, user_id=user_id, role=payload.get("role"))
+    except JWTError:
+        raise credentials_exception
+
+    user = crud.get_user_by_username(db, username=token_data.username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+def get_current_active_user(
+    current_user: models.User = Depends(get_current_user)
+) -> models.User:
+    """
+    Dependency to ensure the retrieved user is active.
+    """
+    if not current_user.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
+    return current_user
+```
+
+```python
+# /main.py
+
+import uuid
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from sqlalchemy.orm import Session
+
+from . import crud, models, schemas, auth
+from .database import get_db, engine
+from .audit import audit_logger
+from .models import UserRole
+
+# Create all database tables if they don't exist (for development)
+# In production, use a migration tool like Alembic.
+# models.Base.metadata.create_all(bind=engine)
+
+app = FastAPI(
+    title="EMR Backend System",
+    description="HIPAA-Compliant EMR backend services.",
+    version="1.0.0",
+)
+
+@app.get(
+    "/patients/{patient_id}/demographics",
+    response_model=schemas.PatientDemographicsResponse,
+    summary="Fetch Patient Demographics",
+    tags=["Patients"],
+    dependencies=[Depends(auth.get_current_active_user)]
+)
+def read_patient_demographics(
+    patient_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user)
+):
+    """
+    Retrieves demographic information for a specific patient.
+
+    Access is strictly controlled and audited:
+    - Requires a valid JWT for an active user.
+    - User role must be authorized for patient data access.
+    - A specific check verifies the user's right to access this particular patient.
+    - All access attempts (success or failure) are logged.
+    """
+    action_name = "FETCH_PATIENT_DEMOGRAPHICS"
+    client_ip = request.client.host
+
+    # 1. Authorization Check: Role-based access
+    if current_user.role not in [UserRole.CLINICIAN, UserRole.ADMIN]:
+        audit_logger.log(
+            db,
+            performing_user_id=current_user.id,
+            performing_user_ip=client_ip,
+            action=action_name,
+            status=schemas.AuditEventStatus.FAILURE,
+            target_patient_id=patient_id,
+            details={"reason": f"User role '{current_user.role}' not authorized."}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not have permission to access patient data.",
+        )
+
+    # 2. Authorization Check: Patient-specific access (Break-the-Glass context)
+    has_access = crud.check_user_patient_access(db, user_id=current_user.id, patient_id=patient_id)
+    if not has_access:
+        audit_logger.log(
+            db,
+            performing_user_id=current_user.id,
+            performing_user_ip=client_ip,
+            action=action_name,
+            status=schemas.AuditEventStatus.FAILURE,
+            target_patient_id=patient_id,
+            details={"reason": "User does not have a verified relationship with the patient."}
+        )
+        # Return 404 to avoid leaking information about patient existence
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Patient not found or access denied.",
+        )
+
+    # 3. Data Retrieval
+    db_patient = crud.get_patient_by_id(db, patient_id=patient_id)
+    if db_patient is None:
+        # This case is logged as a failure, even though it's a 404
+        audit_logger.log(
+            db,
+            performing_user_id=current_user.id,
+            performing_user_ip=client_ip,
+            action=action_name,
+            status=schemas.AuditEventStatus.FAILURE,
+            target_patient_id=patient_id,
+            details={"reason": "Patient record not found in database."}
+        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found.")
+
+    # 4. Success Auditing and Response
+    audit_logger.log(
+        db,
+        performing_user_id=current_user.id,
+        performing_user_ip=client_ip,
+        action=action_name,
+        status=schemas.AuditEventStatus.SUCCESS,
+        target_patient_id=patient_id,
+        details={"accessed_fields": list(schemas.PatientDemographicsResponse.__fields__.keys())}
+    )
+
+    return db_patient
+```
