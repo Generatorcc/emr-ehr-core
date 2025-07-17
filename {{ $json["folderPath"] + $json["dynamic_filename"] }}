@@ -1,0 +1,645 @@
+```python
+# /core/config.py
+import os
+from pydantic import BaseSettings
+
+class Settings(BaseSettings):
+    """Application-wide settings loaded from environment variables."""
+    # Security
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "fallback_secret_key_for_development_only")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+
+    # Database
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:password@localhost/emr_db")
+
+    class Config:
+        case_sensitive = True
+
+settings = Settings()
+
+# /db/session.py
+from typing import AsyncGenerator
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+from core.config import settings
+
+engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True)
+AsyncSessionLocal = sessionmaker(
+    autocommit=False, 
+    autoflush=False, 
+    bind=engine, 
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+
+Base = declarative_base()
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Dependency to get an async database session."""
+    async with AsyncSessionLocal() as session:
+        yield session
+
+# /db/models/base.py
+import uuid
+from sqlalchemy import Column, DateTime, func
+from sqlalchemy.dialects.postgresql import UUID
+from db.session import Base
+
+class BaseMixin:
+    """Base model with common columns like id, created_at, and updated_at."""
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+# /db/models/user.py
+from sqlalchemy import Column, String, Boolean, Enum as SQLAlchemyEnum
+from sqlalchemy.orm import relationship
+from db.models.base import Base, BaseMixin
+import enum
+
+class UserRole(str, enum.Enum):
+    """Enumeration for user roles to enforce access control."""
+    DOCTOR = "doctor"
+    NURSE = "nurse"
+    ADMIN = "admin"
+    AUDITOR = "auditor"
+
+class User(Base, BaseMixin):
+    """User model representing a system user."""
+    __tablename__ = "users"
+
+    username = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    full_name = Column(String, nullable=False)
+    role = Column(SQLAlchemyEnum(UserRole), nullable=False)
+    is_active = Column(Boolean, default=True)
+
+    authored_notes = relationship("ClinicalNote", back_populates="author", foreign_keys="[ClinicalNote.author_id]")
+
+# /db/models/patient.py
+from sqlalchemy import Column, String, Date
+from sqlalchemy.orm import relationship
+from db.models.base import Base, BaseMixin
+
+class Patient(Base, BaseMixin):
+    """Patient model representing a patient in the EMR."""
+    __tablename__ = "patients"
+
+    mrn = Column(String, unique=True, index=True, nullable=False)  # Medical Record Number
+    full_name = Column(String, index=True, nullable=False)
+    date_of_birth = Column(Date, nullable=False)
+
+    notes = relationship("ClinicalNote", back_populates="patient", cascade="all, delete-orphan")
+
+# /db/models/clinical_note.py
+from sqlalchemy import Column, ForeignKey, Text, Integer
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from sqlalchemy.ext.hybrid import hybrid_property
+from db.models.base import Base, BaseMixin
+
+class ClinicalNote(Base, BaseMixin):
+    """Clinical Note model for patient encounters."""
+    __tablename__ = "clinical_notes"
+
+    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False, index=True)
+    author_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    content = Column(Text, nullable=False) # In a real system, this would be encrypted at rest.
+    version = Column(Integer, nullable=False, default=1)
+    
+    # Self-referencing FK for tracking amendments
+    amendment_to_id = Column(UUID(as_uuid=True), ForeignKey("clinical_notes.id"), nullable=True, index=True)
+
+    patient = relationship("Patient", back_populates="notes")
+    author = relationship("User", back_populates="authored_notes", foreign_keys=[author_id])
+    
+    amendments = relationship("ClinicalNote", back_populates="original_note", remote_side=[amendment_to_id])
+    original_note = relationship("ClinicalNote", back_populates="amendments", remote_side=[id])
+
+    @hybrid_property
+    def is_amendment(self):
+        return self.amendment_to_id is not None
+
+# /db/models/audit_log.py
+from sqlalchemy import Column, String, ForeignKey, JSON
+from sqlalchemy.dialects.postgresql import UUID
+from db.models.base import Base, BaseMixin
+
+class AuditLog(Base, BaseMixin):
+    """Audit Log model for tracking all access and modifications to PHI."""
+    __tablename__ = "audit_logs"
+
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), index=True)
+    action = Column(String, nullable=False, index=True)
+    target_entity = Column(String, nullable=True)
+    target_id = Column(String, nullable=True, index=True)
+    details = Column(JSON, nullable=True) # e.g., IP address, user-agent
+
+# /db/schemas/token.py
+from pydantic import BaseModel
+
+class Token(BaseModel):
+    """Schema for the JWT access token response."""
+    access_token: str
+    token_type: str = "bearer"
+
+class TokenData(BaseModel):
+    """Schema for the data encoded within the JWT."""
+    username: str | None = None
+    role: str | None = None
+
+# /db/schemas/user.py
+import uuid
+from pydantic import BaseModel, Field
+from db.models.user import UserRole
+
+class UserBase(BaseModel):
+    username: str = Field(..., example="johndoe")
+    full_name: str = Field(..., example="John Doe")
+    role: UserRole
+
+class UserCreate(UserBase):
+    password: str
+
+class UserInDB(UserBase):
+    id: uuid.UUID
+    is_active: bool
+
+    class Config:
+        orm_mode = True
+
+class UserPublic(BaseModel):
+    """Public-facing user schema, omitting sensitive details."""
+    id: uuid.UUID
+    full_name: str
+    role: UserRole
+
+    class Config:
+        orm_mode = True
+
+# /db/schemas/note.py
+import uuid
+from datetime import datetime
+from pydantic import BaseModel, Field
+from db.schemas.user import UserPublic
+
+class ClinicalNoteBase(BaseModel):
+    content: str = Field(..., min_length=10, description="The clinical content of the note.")
+
+class ClinicalNoteCreate(ClinicalNoteBase):
+    pass
+
+class ClinicalNoteAmendmentCreate(ClinicalNoteBase):
+    pass
+
+class ClinicalNotePublic(ClinicalNoteBase):
+    """Schema for returning a clinical note, protecting PHI and internal details."""
+    id: uuid.UUID
+    patient_id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+    version: int
+    is_amendment: bool
+    author: UserPublic
+
+    class Config:
+        orm_mode = True
+
+# /core/security.py
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifies a plain password against its hashed version."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """Hashes a plain password."""
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    """Creates a JWT access token."""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+# /crud/crud_user.py
+from typing import Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from db.models.user import User
+from db.schemas.user import UserCreate
+from core.security import get_password_hash
+
+async def get_user_by_username(db: AsyncSession, username: str) -> Optional[User]:
+    """Fetches a user by their username."""
+    result = await db.execute(select(User).filter(User.username == username))
+    return result.scalars().first()
+
+async def create_user(db: AsyncSession, user: UserCreate) -> User:
+    """Creates a new user in the database."""
+    hashed_password = get_password_hash(user.password)
+    db_user = User(
+        username=user.username,
+        full_name=user.full_name,
+        role=user.role,
+        hashed_password=hashed_password,
+    )
+    db.add(db_user)
+    await db.commit()
+    await db.refresh(db_user)
+    return db_user
+
+# /crud/crud_audit.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from db.models.audit_log import AuditLog
+from typing import Any, Dict
+import uuid
+
+async def create_audit_log_entry(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    action: str,
+    target_entity: str,
+    target_id: Any,
+    details: Dict[str, Any]
+) -> AuditLog:
+    """Creates a new audit log entry."""
+    audit_entry = AuditLog(
+        user_id=user_id,
+        action=action,
+        target_entity=target_entity,
+        target_id=str(target_id),
+        details=details
+    )
+    db.add(audit_entry)
+    await db.commit()
+    await db.refresh(audit_entry)
+    return audit_entry
+
+# /services/audit_service.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from crud import crud_audit
+from db.models.user import User
+from fastapi import Request
+import uuid
+
+class AuditLogger:
+    """A service class to centralize audit logging operations."""
+    
+    @staticmethod
+    async def log(
+        db: AsyncSession,
+        request: Request,
+        current_user: User,
+        action: str,
+        target_entity: str,
+        target_id: uuid.UUID,
+        extra_details: dict = None
+    ):
+        """Creates a standardized audit log entry."""
+        details = {
+            "ip_address": request.client.host if request.client else "unknown",
+            "user_agent": request.headers.get("user-agent", "unknown"),
+        }
+        if extra_details:
+            details.update(extra_details)
+
+        await crud_audit.create_audit_log_entry(
+            db=db,
+            user_id=current_user.id,
+            action=action,
+            target_entity=target_entity,
+            target_id=target_id,
+            details=details,
+        )
+
+# /crud/crud_note.py
+import uuid
+from typing import List
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
+from db.models.clinical_note import ClinicalNote
+from db.schemas.note import ClinicalNoteCreate, ClinicalNoteAmendmentCreate
+
+async def get_note_by_id(db: AsyncSession, note_id: uuid.UUID) -> ClinicalNote | None:
+    """Fetches a specific clinical note by its ID, preloading author info."""
+    result = await db.execute(
+        select(ClinicalNote)
+        .options(selectinload(ClinicalNote.author))
+        .filter(ClinicalNote.id == note_id)
+    )
+    return result.scalars().first()
+
+async def get_notes_for_patient(db: AsyncSession, patient_id: uuid.UUID) -> List[ClinicalNote]:
+    """Fetches all clinical notes for a given patient, ordered by creation date."""
+    result = await db.execute(
+        select(ClinicalNote)
+        .options(selectinload(ClinicalNote.author))
+        .filter(ClinicalNote.patient_id == patient_id)
+        .order_by(ClinicalNote.created_at.desc())
+    )
+    return result.scalars().all()
+
+async def create_patient_note(db: AsyncSession, note: ClinicalNoteCreate, patient_id: uuid.UUID, author_id: uuid.UUID) -> ClinicalNote:
+    """Creates a new clinical note for a patient."""
+    db_note = ClinicalNote(
+        content=note.content,
+        patient_id=patient_id,
+        author_id=author_id,
+        version=1
+    )
+    db.add(db_note)
+    await db.commit()
+    await db.refresh(db_note, attribute_names=["author"])
+    return db_note
+
+async def create_note_amendment(
+    db: AsyncSession, 
+    note: ClinicalNoteAmendmentCreate, 
+    original_note: ClinicalNote, 
+    author_id: uuid.UUID
+) -> ClinicalNote:
+    """Creates an amendment to an existing clinical note."""
+    latest_version = original_note.version + len(original_note.amendments)
+    
+    db_amendment = ClinicalNote(
+        content=note.content,
+        patient_id=original_note.patient_id,
+        author_id=author_id,
+        version=latest_version + 1,
+        amendment_to_id=original_note.id
+    )
+    db.add(db_amendment)
+    await db.commit()
+    await db.refresh(db_amendment, attribute_names=["author"])
+    return db_amendment
+
+# /api/v1/dependencies.py
+from typing import Callable, List
+from fastapi import Depends, HTTPException, status, Request
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import ValidationError
+
+from core.config import settings
+from db.session import get_db
+from db.models.user import User, UserRole
+from db.schemas.token import TokenData
+from crud import crud_user
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
+
+async def get_current_user(
+    db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme)
+) -> User:
+    """Decodes JWT and retrieves the current user from the database."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        token_data = TokenData(username=payload.get("sub"), role=payload.get("role"))
+        if token_data.username is None:
+            raise credentials_exception
+    except (JWTError, ValidationError):
+        raise credentials_exception
+    
+    user = await crud_user.get_user_by_username(db, username=token_data.username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+def require_role(allowed_roles: List[UserRole]) -> Callable[[User], None]:
+    """Dependency factory to enforce role-based access control."""
+    def role_checker(current_user: User = Depends(get_current_user)):
+        if current_user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The user does not have sufficient privileges for this resource.",
+            )
+    return role_checker
+
+async def get_current_active_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Ensures the retrieved user is active."""
+    if not current_user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+# /api/v1/endpoints/auth.py
+from datetime import timedelta
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core import security
+from core.config import settings
+from db.session import get_db
+from crud import crud_user
+from db.schemas import token
+from api.v1.dependencies import get_current_active_user
+from db.schemas.user import UserPublic
+
+router = APIRouter()
+
+@router.post("/token", response_model=token.Token)
+async def login_for_access_token(
+    db: AsyncSession = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()
+):
+    """Authenticates user and returns a JWT access token."""
+    user = await crud_user.get_user_by_username(db, username=form_data.username)
+    if not user or not security.verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = security.create_access_token(
+        data={"sub": user.username, "role": user.role.value}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@router.get("/me", response_model=UserPublic)
+async def read_users_me(current_user: UserPublic = Depends(get_current_active_user)):
+    """Returns the profile of the currently authenticated user."""
+    return current_user
+
+# /api/v1/endpoints/notes.py
+import uuid
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from db.session import get_db
+from db.models.user import User, UserRole
+from db.schemas.note import ClinicalNoteCreate, ClinicalNotePublic, ClinicalNoteAmendmentCreate
+from crud import crud_note
+from api.v1.dependencies import get_current_active_user, require_role
+from services.audit_service import AuditLogger
+
+router = APIRouter()
+
+@router.post(
+    "/patients/{patient_id}/notes",
+    response_model=ClinicalNotePublic,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_role([UserRole.DOCTOR]))],
+)
+async def create_clinical_note(
+    request: Request,
+    patient_id: uuid.UUID,
+    note_in: ClinicalNoteCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Creates a new clinical note for a specific patient.
+    - **Access**: `DOCTOR` role required.
+    - **Auditing**: Logs note creation event.
+    """
+    # In a real system, you'd verify patient_id exists.
+    note = await crud_note.create_patient_note(
+        db=db, note=note_in, patient_id=patient_id, author_id=current_user.id
+    )
+    await AuditLogger.log(
+        db, request, current_user, "CREATE_CLINICAL_NOTE", "ClinicalNote", note.id
+    )
+    return note
+
+@router.get(
+    "/patients/{patient_id}/notes",
+    response_model=List[ClinicalNotePublic],
+    dependencies=[Depends(require_role([UserRole.DOCTOR, UserRole.NURSE]))],
+)
+async def list_patient_notes(
+    request: Request,
+    patient_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Retrieves all clinical notes for a specific patient.
+    - **Access**: `DOCTOR` or `NURSE` role required.
+    - **Auditing**: Logs patient record access event.
+    """
+    notes = await crud_note.get_notes_for_patient(db=db, patient_id=patient_id)
+    await AuditLogger.log(
+        db, request, current_user, "VIEW_PATIENT_NOTES", "Patient", patient_id
+    )
+    return notes
+
+@router.get(
+    "/notes/{note_id}",
+    response_model=ClinicalNotePublic,
+    dependencies=[Depends(require_role([UserRole.DOCTOR, UserRole.NURSE, UserRole.AUDITOR]))],
+)
+async def get_clinical_note(
+    request: Request,
+    note_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Retrieves a single clinical note by its ID.
+    - **Access**: `DOCTOR`, `NURSE`, or `AUDITOR` role required.
+    - **Auditing**: Logs note access event.
+    """
+    note = await crud_note.get_note_by_id(db=db, note_id=note_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Clinical note not found")
+    
+    await AuditLogger.log(
+        db, request, current_user, "VIEW_CLINICAL_NOTE", "ClinicalNote", note.id
+    )
+    return note
+
+@router.post(
+    "/notes/{note_id}/amendments",
+    response_model=ClinicalNotePublic,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_role([UserRole.DOCTOR]))],
+)
+async def create_note_amendment(
+    request: Request,
+    note_id: uuid.UUID,
+    amendment_in: ClinicalNoteAmendmentCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Creates an amendment to an existing clinical note. Original note is preserved.
+    - **Access**: `DOCTOR` role required. Only the original author can amend.
+    - **Auditing**: Logs note amendment event.
+    """
+    original_note = await crud_note.get_note_by_id(db=db, note_id=note_id)
+    if not original_note:
+        raise HTTPException(status_code=404, detail="Clinical note not found")
+    if original_note.author_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the original author can amend a note")
+    if original_note.is_amendment:
+        raise HTTPException(status_code=400, detail="Cannot amend an amendment. Amend the original note.")
+
+    amendment = await crud_note.create_note_amendment(
+        db=db, note=amendment_in, original_note=original_note, author_id=current_user.id
+    )
+    await AuditLogger.log(
+        db, request, current_user, "AMEND_CLINICAL_NOTE", "ClinicalNote", amendment.id,
+        extra_details={"original_note_id": str(original_note.id)}
+    )
+    return amendment
+
+# /api/v1/api.py
+from fastapi import APIRouter
+from api.v1.endpoints import auth, notes
+
+api_router = APIRouter()
+api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+api_router.include_router(notes.router, prefix="", tags=["Clinical Notes"])
+
+# /main.py
+from fastapi import FastAPI
+from api.v1.api import api_router
+from db.session import Base, engine
+
+app = FastAPI(
+    title="Secure EMR API",
+    description="A HIPAA-compliant backend for a modern Electronic Medical Record system.",
+    version="1.0.0",
+    redoc_url=None, # Disable for production
+)
+
+@app.on_event("startup")
+async def startup_event():
+    """On startup, create all database tables if they don't exist."""
+    async with engine.begin() as conn:
+        # In a production environment with Alembic, you would remove this.
+        await conn.run_sync(Base.metadata.create_all)
+
+app.include_router(api_router, prefix="/api/v1")
+
+@app.get("/health", status_code=200, tags=["System"])
+async def health_check():
+    """Simple health check endpoint."""
+    return {"status": "ok"}
+```
