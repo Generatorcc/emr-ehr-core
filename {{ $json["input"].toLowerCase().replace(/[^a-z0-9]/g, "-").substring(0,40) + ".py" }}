@@ -1,54 +1,118 @@
 ```python
-# /core/config.py
+# file: core/config.py
 import os
-from pydantic_settings import BaseSettings
-
+from pydantic import BaseSettings, AnyHttpUrl
+from typing import List
 
 class Settings(BaseSettings):
     """
-    Application configuration settings.
-    Values are loaded from environment variables.
+    Application settings, loaded from environment variables.
+    A .env file can be used for local development.
     """
-    PROJECT_NAME: str = "EMR Secure Messaging Service"
+    # Application Metadata
+    PROJECT_NAME: str = "EMR-Core-API"
     API_V1_STR: str = "/api/v1"
-
-    # Security settings
-    # In production, use a secrets manager. Generate with:
-    # openssl rand -hex 32
-    SECRET_KEY: str
-    PGCRYPTO_KEY: str # Key for field-level database encryption
+    
+    # Security Settings
+    # To generate a new secret: openssl rand -hex 32
+    SECRET_KEY: str = os.environ.get("SECRET_KEY", "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7")
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
-
-    # Database settings
-    POSTGRES_SERVER: str
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
-    POSTGRES_DB: str
-    DATABASE_URL: str | None = None
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30 # Standard session duration
+    
+    # CORS (Cross-Origin Resource Sharing)
+    BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = [
+        "https://localhost:3000",
+        "https://localhost:8080",
+    ]
+    
+    # Database Settings
+    # Example: postgresql+asyncpg://user:password@host:port/db
+    DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql+asyncpg://postgres:password@localhost:5432/emr_db")
+    # Note: For production, use an encrypted database instance (e.g., AWS RDS with encryption enabled).
 
     class Config:
-        env_file = ".env"
         case_sensitive = True
-
-    def __init__(self, **values):
-        super().__init__(**values)
-        self.DATABASE_URL = (
-            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
-        )
-
+        env_file = ".env"
 
 settings = Settings()
 
-# /db/base_class.py
+# file: core/security.py
+from datetime import datetime, timedelta
+from typing import Any, Union
+
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+
+from core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+ALGORITHM = settings.ALGORITHM
+SECRET_KEY = settings.SECRET_KEY
+
+def create_access_token(subject: Union[str, Any], expires_delta: timedelta = None) -> str:
+    """
+    Creates a JWT access token.
+    """
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode = {"exp": expire, "sub": str(subject)}
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Verifies a plain-text password against a hashed one.
+    """
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """
+    Hashes a plain-text password.
+    """
+    return pwd_context.hash(password)
+
+
+# file: db/session.py
+from typing import AsyncGenerator
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+
+from core.config import settings
+
+# Create an async engine instance.
+engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True)
+
+# Create a session factory.
+AsyncSessionLocal = sessionmaker(
+    autocommit=False, 
+    autoflush=False, 
+    bind=engine, 
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Dependency to get an async database session.
+    Ensures the session is properly closed after the request.
+    """
+    async with AsyncSessionLocal() as session:
+        yield session
+
+# file: db/base_class.py
 from typing import Any
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
 
-
 @as_declarative()
 class Base:
-    """Base class for SQLAlchemy models."""
+    """
+    Base class for all SQLAlchemy models.
+    It provides a default __tablename__ generation.
+    """
     id: Any
     __name__: str
 
@@ -57,576 +121,616 @@ class Base:
     def __tablename__(cls) -> str:
         return cls.__name__.lower() + "s"
 
-# /db/session.py
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError
-from core.config import settings
+# file: db/base.py
+# For easy imports
+from db.base_class import Base
+from db.models.user import User
+from db.models.patient import Patient
+from db.models.audit_log import AuditLog
 
-# Create an async engine to the database
-engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True, echo=False)
-AsyncSessionLocal = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
-)
-
-async def get_db() -> AsyncSession:
-    """
-    Dependency function that yields an AsyncSession.
-    Ensures the session is closed after the request is finished.
-    """
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        except SQLAlchemyError as e:
-            await session.rollback()
-            raise e
-        finally:
-            await session.close()
-
-
-# /models/user.py
+# file: db/models/user.py
 import uuid
-from sqlalchemy import Column, String, Boolean, Enum
+from sqlalchemy import Boolean, Column, String, DateTime, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
-from db.base_class import Base
 
+from db.base_class import Base
 
 class User(Base):
-    """Database model for a User (Patient, Provider, Admin)."""
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    full_name = Column(String(255), nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
-    role = Column(Enum("patient", "provider", "admin", name="user_role_enum"), nullable=False)
+    full_name = Column(String(255), index=True)
     is_active = Column(Boolean(), default=True)
+    # Role-based access control (RBAC) field
+    role = Column(String(50), nullable=False, default='clinician') # e.g., 'clinician', 'admin', 'auditor'
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    sent_messages = relationship("SecureMessage", foreign_keys="[SecureMessage.sender_id]", back_populates="sender")
-    received_messages = relationship("SecureMessage", foreign_keys="[SecureMessage.recipient_id]", back_populates="recipient")
+    audit_logs = relationship("AuditLog", back_populates="user")
 
-# /models/audit_log.py
+
+# file: db/models/patient.py
 import uuid
-from sqlalchemy import Column, String, DateTime, Enum, JSON
-from sqlalchemy.dialects.postgresql import UUID, INET
-from sqlalchemy.sql import func
+from sqlalchemy import Boolean, Column, String, Date, DateTime, func
+from sqlalchemy.dialects.postgresql import UUID
+
 from db.base_class import Base
 
+class Patient(Base):
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    # Patient Demographics - Protected Health Information (PHI)
+    first_name = Column(String(100), nullable=False, index=True)
+    last_name = Column(String(100), nullable=False, index=True)
+    date_of_birth = Column(Date, nullable=False)
+    gender = Column(String(20)) # e.g., Male, Female, Other
+    contact_phone = Column(String(20))
+    contact_email = Column(String(255), index=True)
+
+    # System fields
+    is_active = Column(Boolean(), default=True) # For soft deletes
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+# file: db/models/audit_log.py
+import uuid
+from sqlalchemy import Column, String, DateTime, func, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID, INET
+from sqlalchemy.orm import relationship
+
+from db.base_class import Base
 
 class AuditLog(Base):
-    """Database model for HIPAA audit trails."""
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    action = Column(String(100), nullable=False, index=True) # e.g., PATIENT_READ, PATIENT_CREATE
+    resource_type = Column(String(50), nullable=False, default="Patient")
+    resource_id = Column(UUID(as_uuid=True), index=True, nullable=True)
+    status = Column(String(20), nullable=False) # SUCCESS, FAILURE
+    ip_address = Column(INET, nullable=False)
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    performing_user_id = Column(UUID(as_uuid=True), index=True, nullable=False)
-    affected_patient_id = Column(UUID(as_uuid=True), index=True, nullable=True)
-    client_ip_address = Column(INET, nullable=True)
-    action_type = Column(
-        Enum(
-            "LOGIN_SUCCESS", "LOGIN_FAIL",
-            "CREATE_MESSAGE", "VIEW_MESSAGE", "VIEW_MESSAGE_LIST",
-            "ACCESS_PATIENT_RECORD", "MODIFY_PATIENT_RECORD",
-            "EMERGENCY_ACCESS",
-            name="audit_action_enum"
-        ),
-        nullable=False
-    )
-    details = Column(JSON, nullable=True) # For additional context, e.g., resource ID
+    details = Column(String(500))
 
+    user = relationship("User", back_populates="audit_logs")
 
-# /models/message.py
-import uuid
-from sqlalchemy import Column, DateTime, ForeignKey, Text
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-from sqlalchemy_utils import EncryptedType
-from core.config import settings
-from db.base_class import Base
-
-
-class SecureMessage(Base):
-    """Database model for secure messages between users."""
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    thread_id = Column(UUID(as_uuid=True), index=True, nullable=False, default=uuid.uuid4)
-
-    sender_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
-    recipient_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
-
-    # Encrypted PHI content using pgcrypto extension
-    subject = Column(EncryptedType(Text, settings.PGCRYPTO_KEY), nullable=False)
-    body = Column(EncryptedType(Text, settings.PGCRYPTO_KEY), nullable=False)
-
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    read_at = Column(DateTime(timezone=True), nullable=True)
-
-    sender = relationship("User", foreign_keys=[sender_id], back_populates="sent_messages")
-    recipient = relationship("User", foreign_keys=[recipient_id], back_populates="received_messages")
-
-
-# /schemas/user.py
-import uuid
-from pydantic import BaseModel, EmailStr
-
-
-class UserBase(BaseModel):
-    email: EmailStr
-    full_name: str
-    role: str
-
-
-class UserInDBBase(UserBase):
-    id: uuid.UUID
-    is_active: bool
-
-    class Config:
-        from_attributes = True
-
-
-class User(UserInDBBase):
-    pass
-
-
-# /schemas/token.py
+# file: schemas/token.py
 from pydantic import BaseModel
-
+from typing import Optional
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
+class TokenPayload(BaseModel):
+    sub: Optional[str] = None
 
-class TokenData(BaseModel):
-    user_id: str | None = None
-
-
-# /schemas/message.py
+# file: schemas/user.py
 import uuid
-from pydantic import BaseModel
-from datetime import datetime
-from .user import User
+from pydantic import BaseModel, EmailStr
+from typing import Optional
 
+class UserBase(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = None
+    is_active: Optional[bool] = True
+    role: str = "clinician"
 
-class MessageBase(BaseModel):
-    recipient_id: uuid.UUID
-    subject: str
-    body: str
+class UserCreate(UserBase):
+    password: str
 
+class UserUpdate(UserBase):
+    password: Optional[str] = None
 
-class MessageCreate(MessageBase):
-    pass
-
-
-class MessageInDBBase(BaseModel):
+class UserInDBBase(UserBase):
     id: uuid.UUID
-    thread_id: uuid.UUID
-    sender_id: uuid.UUID
-    recipient_id: uuid.UUID
-    subject: str
-    body: str
-    created_at: datetime
-    read_at: datetime | None = None
 
     class Config:
-        from_attributes = True
+        orm_mode = True
 
+class UserResponse(UserInDBBase):
+    pass
 
-class Message(MessageInDBBase):
-    """Schema for returning a message to the client."""
-    sender: User
-    recipient: User
+class UserInDB(UserInDBBase):
+    hashed_password: str
 
-
-# /services/audit_service.py
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import insert
-from models.audit_log import AuditLog
-from models.user import User
-from typing import Any, Dict
+# file: schemas/audit_log.py
 import uuid
+from datetime import datetime
+from pydantic import BaseModel, IPvAnyAddress
 
+class AuditLogBase(BaseModel):
+    action: str
+    resource_type: str
+    resource_id: uuid.UUID
+    status: str
+    details: str | None = None
 
-class AuditService:
-    """Service for handling HIPAA audit logging."""
+class AuditLogCreate(AuditLogBase):
+    user_id: uuid.UUID
+    ip_address: IPvAnyAddress
 
-    async def log_action(
-        self,
-        db: AsyncSession,
-        performing_user: User,
-        action_type: str,
-        client_ip: str | None,
-        affected_patient_id: uuid.UUID | None = None,
-        details: Dict[str, Any] | None = None,
-    ) -> None:
-        """
-        Creates an audit log entry.
+class AuditLogResponse(AuditLogBase):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    ip_address: IPvAnyAddress
+    timestamp: datetime
 
-        Args:
-            db: The database session.
-            performing_user: The user performing the action.
-            action_type: The type of action from the audit_action_enum.
-            client_ip: The IP address of the client.
-            affected_patient_id: The ID of the patient whose data is being accessed/modified.
-            details: A JSON-serializable dict for extra context.
-        """
-        audit_log_stmt = insert(AuditLog).values(
-            performing_user_id=performing_user.id,
-            affected_patient_id=affected_patient_id,
-            client_ip_address=client_ip,
-            action_type=action_type,
-            details=details or {},
-        )
-        await db.execute(audit_log_stmt)
-        await db.commit()
+    class Config:
+        orm_mode = True
 
-audit_service = AuditService()
-
-# /core/security.py
-from datetime import datetime, timedelta
-from typing import Any
+# file: schemas/patient.py
 import uuid
+from datetime import date
+from pydantic import BaseModel, Field, EmailStr
+from typing import Optional
 
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+# Shared properties
+class PatientBase(BaseModel):
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    date_of_birth: date
+    gender: Optional[str] = Field(None, max_length=20)
+    contact_phone: Optional[str] = Field(None, max_length=20)
+    contact_email: Optional[EmailStr] = None
+
+# Properties to receive on patient creation
+class PatientCreate(PatientBase):
+    pass
+
+# Properties to receive on patient update
+class PatientUpdate(BaseModel):
+    first_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    last_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    date_of_birth: Optional[date]
+    gender: Optional[str] = Field(None, max_length=20)
+    contact_phone: Optional[str] = Field(None, max_length=20)
+    contact_email: Optional[EmailStr] = None
+
+# Properties shared by models stored in DB
+class PatientInDBBase(PatientBase):
+    id: uuid.UUID
+    is_active: bool
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        orm_mode = True
+
+# Properties to return to client (API response)
+class PatientResponse(PatientInDBBase):
+    pass
+
+# file: crud/base.py
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
+
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
+from db.base_class import Base
+
+ModelType = TypeVar("ModelType", bound=Base)
+CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
+UpdateSchemaType = TypeVar("UpdateSchemaType", bound=BaseModel)
+
+class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
+    def __init__(self, model: Type[ModelType]):
+        self.model = model
+
+    async def get(self, db: AsyncSession, id: Any) -> Optional[ModelType]:
+        result = await db.execute(select(self.model).filter(self.model.id == id))
+        return result.scalars().first()
+
+    async def get_multi(self, db: AsyncSession, *, skip: int = 0, limit: int = 100) -> List[ModelType]:
+        result = await db.execute(select(self.model).offset(skip).limit(limit))
+        return result.scalars().all()
+
+    async def create(self, db: AsyncSession, *, obj_in: CreateSchemaType) -> ModelType:
+        obj_in_data = jsonable_encoder(obj_in)
+        db_obj = self.model(**obj_in_data)
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
+
+    async def update(
+        self,
+        db: AsyncSession,
+        *,
+        db_obj: ModelType,
+        obj_in: Union[UpdateSchemaType, Dict[str, Any]]
+    ) -> ModelType:
+        obj_data = jsonable_encoder(db_obj)
+        if isinstance(obj_in, dict):
+            update_data = obj_in
+        else:
+            update_data = obj_in.dict(exclude_unset=True)
+        for field in obj_data:
+            if field in update_data:
+                setattr(db_obj, field, update_data[field])
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
+
+    async def remove(self, db: AsyncSession, *, id: Any) -> Optional[ModelType]:
+        obj = await self.get(db, id)
+        if obj:
+            await db.delete(obj)
+            await db.commit()
+        return obj
+
+# file: crud/crud_user.py
+from typing import Optional
+import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+
+from crud.base import CRUDBase
+from db.models import User
+from schemas.user import UserCreate, UserUpdate
+from core.security import get_password_hash
+
+class CRUDUser(CRUDBase[User, UserCreate, UserUpdate]):
+    async def get_by_email(self, db: AsyncSession, *, email: str) -> Optional[User]:
+        result = await db.execute(select(User).filter(User.email == email))
+        return result.scalars().first()
+
+    async def create(self, db: AsyncSession, *, obj_in: UserCreate) -> User:
+        db_obj = User(
+            email=obj_in.email,
+            hashed_password=get_password_hash(obj_in.password),
+            full_name=obj_in.full_name,
+            role=obj_in.role
+        )
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
+
+    async def update(self, db: AsyncSession, *, db_obj: User, obj_in: UserUpdate) -> User:
+        update_data = obj_in.dict(exclude_unset=True)
+        if "password" in update_data and update_data["password"]:
+            hashed_password = get_password_hash(update_data["password"])
+            del update_data["password"]
+            update_data["hashed_password"] = hashed_password
+        return await super().update(db, db_obj=db_obj, obj_in=update_data)
+
+user = CRUDUser(User)
+
+# file: crud/crud_audit_log.py
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from crud.base import CRUDBase
+from db.models import AuditLog
+from schemas.audit_log import AuditLogCreate
+
+class CRUDAuditLog(CRUDBase[AuditLog, AuditLogCreate, AuditLogCreate]):
+    async def log_event(self, db: AsyncSession, *, log_in: AuditLogCreate) -> AuditLog:
+        return await self.create(db, obj_in=log_in)
+
+audit_log = CRUDAuditLog(AuditLog)
+
+# file: crud/crud_patient.py
+import uuid
+from typing import List
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+
+from crud.base import CRUDBase
+from db.models import Patient
+from schemas.patient import PatientCreate, PatientUpdate
+
+class CRUDPatient(CRUDBase[Patient, PatientCreate, PatientUpdate]):
+    async def get_multi_active(self, db: AsyncSession, *, skip: int = 0, limit: int = 100) -> List[Patient]:
+        result = await db.execute(
+            select(self.model)
+            .filter(self.model.is_active == True)
+            .offset(skip)
+            .limit(limit)
+        )
+        return result.scalars().all()
+
+    async def soft_delete(self, db: AsyncSession, *, id: uuid.UUID) -> Patient | None:
+        db_obj = await self.get(db, id=id)
+        if not db_obj:
+            return None
+        
+        db_obj.is_active = False
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
+
+patient = CRUDPatient(Patient)
+
+
+# file: api/deps.py
+from typing import AsyncGenerator
+from fastapi import Depends, HTTPException, status, Request
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from pydantic import ValidationError
+
 from core.config import settings
-from db.session import get_db
-from models.user import User
-from schemas.token import TokenData
-from services.audit_service import audit_service
+from db.session import AsyncSession, get_db
+from schemas.token import TokenPayload
+from schemas.user import UserResponse
+from schemas.audit_log import AuditLogCreate
+from crud import crud_user, crud_audit_log
+from db.models import User
 
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/login/token")
-
-ALGORITHM = settings.ALGORITHM
-SECRET_KEY = settings.SECRET_KEY
-
-
-def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
-    """Creates a JWT access token."""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verifies a plain password against a hashed one."""
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password: str) -> str:
-    """Hashes a plain password."""
-    return pwd_context.hash(password)
-
+# OAuth2 scheme
+reusable_oauth2 = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/login/access-token")
 
 async def get_current_user(
-    db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme)
+    db: AsyncSession = Depends(get_db), token: str = Depends(reusable_oauth2)
 ) -> User:
-    """
-    Decodes JWT token to get the current user.
-    Raises credentials exception if token is invalid or user not found.
-    """
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str | None = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-        token_data = TokenData(user_id=user_id)
-    except JWTError:
-        raise credentials_exception
-
-    user_uuid = uuid.UUID(token_data.user_id)
-    result = await db.execute(select(User).where(User.id == user_uuid))
-    user = result.scalars().first()
-    if user is None:
-        raise credentials_exception
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        token_data = TokenPayload(**payload)
+    except (JWTError, ValidationError):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Could not validate credentials",
+        )
+    user = await crud_user.get(db, id=token_data.sub)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return user
-
 
 async def get_current_active_user(
     current_user: User = Depends(get_current_user),
-    request: Request = None,
-    db: AsyncSession = Depends(get_db)
-) -> User:
-    """
-    Ensures the current user is active.
-    This is the primary dependency for protected endpoints.
-    """
+) -> UserResponse:
     if not current_user.is_active:
-        await audit_service.log_action(
-            db=db,
-            performing_user=current_user,
-            action_type="LOGIN_FAIL",
-            client_ip=request.client.host if request else None,
-            details={"reason": "Inactive user attempted access."},
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
+    return UserResponse.from_orm(current_user)
+
+async def audit_log_transaction(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Dependency to be used in endpoint functions to log audit trails.
+    This is a factory that returns a logging function.
+    """
+    async def log_it(
+        action: str,
+        user: UserResponse,
+        resource_id: uuid.UUID | None = None,
+        status: str = "SUCCESS",
+        details: str | None = None,
+    ) -> None:
+        log_entry = AuditLogCreate(
+            user_id=user.id,
+            ip_address=request.client.host,
+            action=action,
+            resource_type="Patient",
+            resource_id=resource_id,
+            status=status,
+            details=details,
         )
-        raise HTTPException(status_code=400, detail="Inactive user")
-    return current_user
+        await crud_audit_log.create(db, obj_in=log_entry)
+        
+    return log_it
 
+# file: api/v1/endpoints/login.py
+from datetime import timedelta
+from typing import Any
 
-# /crud/crud_message.py
-import uuid
-from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
-from sqlalchemy import and_, or_, update
-from models.message import SecureMessage
-from models.user import User
-from schemas.message import MessageCreate
 
-
-async def create_message(db: AsyncSession, *, obj_in: MessageCreate, sender: User) -> SecureMessage:
-    """Creates a new secure message in the database."""
-    db_obj = SecureMessage(
-        sender_id=sender.id,
-        recipient_id=obj_in.recipient_id,
-        subject=obj_in.subject,
-        body=obj_in.body,
-    )
-    db.add(db_obj)
-    await db.commit()
-    await db.refresh(db_obj)
-    return db_obj
-
-
-async def get_message_by_id(db: AsyncSession, *, message_id: uuid.UUID, user: User) -> SecureMessage | None:
-    """
-    Retrieves a message by ID, ensuring the requesting user is authorized.
-    Marks the message as read if the user is the recipient.
-    """
-    stmt = (
-        select(SecureMessage)
-        .where(SecureMessage.id == message_id)
-        .where(or_(SecureMessage.sender_id == user.id, SecureMessage.recipient_id == user.id))
-        .options(selectinload(SecureMessage.sender), selectinload(SecureMessage.recipient))
-    )
-    result = await db.execute(stmt)
-    message = result.scalars().first()
-
-    if message and message.recipient_id == user.id and message.read_at is None:
-        message.read_at = datetime.utcnow()
-        await db.commit()
-        await db.refresh(message)
-
-    return message
-
-
-async def get_user_inbox(db: AsyncSession, *, user: User, skip: int = 0, limit: int = 100) -> list[SecureMessage]:
-    """Retrieves all messages where the user is the recipient (inbox)."""
-    stmt = (
-        select(SecureMessage)
-        .where(SecureMessage.recipient_id == user.id)
-        .order_by(SecureMessage.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-        .options(selectinload(SecureMessage.sender), selectinload(SecureMessage.recipient))
-    )
-    result = await db.execute(stmt)
-    return result.scalars().all()
-
-
-async def get_user_sent_messages(db: AsyncSession, *, user: User, skip: int = 0, limit: int = 100) -> list[SecureMessage]:
-    """Retrieves all messages where the user is the sender."""
-    stmt = (
-        select(SecureMessage)
-        .where(SecureMessage.sender_id == user.id)
-        .order_by(SecureMessage.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-        .options(selectinload(SecureMessage.sender), selectinload(SecureMessage.recipient))
-    )
-    result = await db.execute(stmt)
-    return result.scalars().all()
-
-
-# /api/v1/endpoints/messaging.py
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from sqlalchemy.ext.asyncio import AsyncSession
-import uuid
-from typing import List
-
-from core.security import get_current_active_user
-from crud import crud_message
-from db.session import get_db
-from models.user import User
-from schemas.message import MessageCreate, Message
-from services.audit_service import audit_service
+from api import deps
+from core import security
+from core.config import settings
+from crud import crud_user
+from schemas.token import Token
 
 router = APIRouter()
 
-@router.post("/", response_model=Message, status_code=status.HTTP_201_CREATED)
-async def send_message(
-    *,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-    message_in: MessageCreate,
-    current_user: User = Depends(get_current_active_user),
-):
+@router.post("/access-token", response_model=Token)
+async def login_access_token(
+    db: AsyncSession = Depends(deps.get_db),
+    form_data: OAuth2PasswordRequestForm = Depends(),
+) -> Any:
     """
-    Send a new secure message.
-    The sender is the currently authenticated user.
+    OAuth2 compatible token login, get an access token for future requests.
     """
-    message = await crud_message.create_message(db=db, obj_in=message_in, sender=current_user)
+    user = await crud_user.get_by_email(db, email=form_data.username)
+    if not user or not security.verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
     
-    # Audit PHI creation
-    # Determine which user is the patient for audit logging purposes.
-    affected_patient_id = None
-    if current_user.role == 'patient':
-        affected_patient_id = current_user.id
-    elif message_in.recipient_id: # Assuming recipient is a patient, more complex logic for provider-provider msg needed
-         # In a real system, you'd look up the recipient to check their role.
-         affected_patient_id = message_in.recipient_id
-
-    await audit_service.log_action(
-        db=db,
-        performing_user=current_user,
-        action_type="CREATE_MESSAGE",
-        client_ip=request.client.host,
-        affected_patient_id=affected_patient_id,
-        details={"message_id": str(message.id), "recipient_id": str(message_in.recipient_id)}
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = security.create_access_token(
+        user.id, expires_delta=access_token_expires
     )
     
-    # Reload to populate relationships for the response model
-    return await crud_message.get_message_by_id(db=db, message_id=message.id, user=current_user)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+    }
 
-@router.get("/inbox", response_model=List[Message])
-async def read_inbox(
+
+# file: api/v1/endpoints/patients.py
+import uuid
+from typing import List, Any, Callable
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api import deps
+from crud import crud_patient
+from schemas.patient import PatientCreate, PatientResponse, PatientUpdate
+from schemas.user import UserResponse
+
+router = APIRouter()
+
+@router.post("/", response_model=PatientResponse, status_code=status.HTTP_201_CREATED)
+async def create_patient(
     *,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(deps.get_db),
+    patient_in: PatientCreate,
+    current_user: UserResponse = Depends(deps.get_current_active_user),
+    audit_logger: Callable = Depends(deps.audit_log_transaction)
+) -> Any:
+    """
+    Create a new patient record.
+    - Requires authenticated and active user.
+    - Logs the creation event to the audit trail.
+    """
+    try:
+        patient = await crud_patient.create(db=db, obj_in=patient_in)
+        await audit_logger(
+            action="PATIENT_CREATE",
+            user=current_user,
+            resource_id=patient.id,
+            status="SUCCESS",
+            details=f"Patient {patient.first_name} {patient.last_name} created."
+        )
+        return patient
+    except Exception as e:
+        await audit_logger(action="PATIENT_CREATE", user=current_user, status="FAILURE", details=str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not create patient.")
+
+
+@router.get("/{patient_id}", response_model=PatientResponse)
+async def read_patient(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    patient_id: uuid.UUID,
+    current_user: UserResponse = Depends(deps.get_current_active_user),
+    audit_logger: Callable = Depends(deps.audit_log_transaction)
+) -> Any:
+    """
+    Get a specific patient by ID.
+    - Requires authenticated and active user.
+    - Logs the read event (PHI access) to the audit trail.
+    """
+    patient = await crud_patient.get(db=db, id=patient_id)
+    if not patient or not patient.is_active:
+        await audit_logger(action="PATIENT_READ", user=current_user, resource_id=patient_id, status="FAILURE", details="Patient not found or inactive.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
+    await audit_logger(action="PATIENT_READ", user=current_user, resource_id=patient.id, status="SUCCESS")
+    return patient
+
+@router.put("/{patient_id}", response_model=PatientResponse)
+async def update_patient(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    patient_id: uuid.UUID,
+    patient_in: PatientUpdate,
+    current_user: UserResponse = Depends(deps.get_current_active_user),
+    audit_logger: Callable = Depends(deps.audit_log_transaction)
+) -> Any:
+    """
+    Update patient information.
+    - Requires authenticated and active user.
+    - Logs the update event to the audit trail.
+    """
+    patient = await crud_patient.get(db=db, id=patient_id)
+    if not patient or not patient.is_active:
+        await audit_logger(action="PATIENT_UPDATE", user=current_user, resource_id=patient_id, status="FAILURE", details="Patient not found or inactive.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+    
+    updated_patient = await crud_patient.update(db=db, db_obj=patient, obj_in=patient_in)
+    await audit_logger(action="PATIENT_UPDATE", user=current_user, resource_id=patient.id, status="SUCCESS")
+    return updated_patient
+
+@router.delete("/{patient_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def deactivate_patient(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    patient_id: uuid.UUID,
+    current_user: UserResponse = Depends(deps.get_current_active_user),
+    audit_logger: Callable = Depends(deps.audit_log_transaction)
+) -> None:
+    """
+    Deactivate a patient record (soft delete).
+    - Requires authenticated and active user.
+    - Logs the deactivation event to the audit trail.
+    """
+    patient = await crud_patient.get(db=db, id=patient_id)
+    if not patient or not patient.is_active:
+        await audit_logger(action="PATIENT_DEACTIVATE", user=current_user, resource_id=patient_id, status="FAILURE", details="Patient not found or already inactive.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
+    await crud_patient.soft_delete(db=db, id=patient_id)
+    await audit_logger(action="PATIENT_DEACTIVATE", user=current_user, resource_id=patient_id, status="SUCCESS")
+    return None
+
+@router.get("/", response_model=List[PatientResponse])
+async def read_patients(
+    db: AsyncSession = Depends(deps.get_db),
     skip: int = 0,
     limit: int = 100,
-    current_user: User = Depends(get_current_active_user),
-):
+    current_user: UserResponse = Depends(deps.get_current_active_user),
+    audit_logger: Callable = Depends(deps.audit_log_transaction)
+) -> Any:
     """
-    Retrieve messages from the current user's inbox.
+    Retrieve a list of active patients.
+    - Requires authenticated and active user.
+    - Logs the list access event.
     """
-    messages = await crud_message.get_user_inbox(db=db, user=current_user, skip=skip, limit=limit)
-    
-    # Audit PHI access
-    affected_patient_id = current_user.id if current_user.role == 'patient' else None
-    await audit_service.log_action(
-        db=db,
-        performing_user=current_user,
-        action_type="VIEW_MESSAGE_LIST",
-        client_ip=request.client.host,
-        affected_patient_id=affected_patient_id,
-        details={"type": "inbox", "count": len(messages)}
-    )
-    
-    return messages
-
-@router.get("/{message_id}", response_model=Message)
-async def read_message(
-    *,
-    request: Request,
-    message_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
-):
-    """
-    Retrieve a single message by its ID.
-    The user must be either the sender or the recipient.
-    This action marks the message as read if the current user is the recipient.
-    """
-    message = await crud_message.get_message_by_id(db=db, message_id=message_id, user=current_user)
-    if not message:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found or access denied")
-    
-    # Audit PHI access
-    # Determine patient context for the audit log
-    affected_patient_id = None
-    if message.sender.role == 'patient':
-        affected_patient_id = message.sender.id
-    elif message.recipient.role == 'patient':
-        affected_patient_id = message.recipient.id
-
-    await audit_service.log_action(
-        db=db,
-        performing_user=current_user,
-        action_type="VIEW_MESSAGE",
-        client_ip=request.client.host,
-        affected_patient_id=affected_patient_id,
-        details={"message_id": str(message.id)}
-    )
-
-    return message
+    patients = await crud_patient.get_multi_active(db, skip=skip, limit=limit)
+    await audit_logger(action="PATIENT_LIST_READ", user=current_user, status="SUCCESS", details=f"Listed {len(patients)} patients.")
+    return patients
 
 
-# /api/v1/api.py
+# file: api/v1/api.py
 from fastapi import APIRouter
-from api.v1.endpoints import messaging
+from api.v1.endpoints import login, patients
 
 api_router = APIRouter()
-api_router.include_router(messaging.router, prefix="/messages", tags=["messaging"])
+api_router.include_router(login.router, prefix="/login", tags=["login"])
+api_router.include_router(patients.router, prefix="/patients", tags=["patients"])
 
-
-# /main.py
-from fastapi import FastAPI, Depends, Request
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
-from starlette.middleware.cors import CORSMiddleware
+# file: main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from api.v1.api import api_router
-from db.session import get_db, engine
 
+# Main FastAPI application instance
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 # Set all CORS enabled origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this to trusted domains
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if settings.BACKEND_CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-@app.on_event("startup")
-async def on_startup():
-    """
-    Application startup event handler.
-    Checks for required database extensions like pgcrypto.
-    """
-    async with engine.begin() as conn:
-        try:
-            # Check for pgcrypto extension, essential for encrypted fields
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto;"))
-        except Exception as e:
-            # In a real system, use a structured logger
-            print(f"Error enabling pgcrypto extension: {e}")
-            # Depending on policy, you might want to exit if pgcrypto is not available
-            # raise SystemExit("pgcrypto extension is required but could not be enabled.")
-
+# Include the main API router
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
-@app.get("/health", status_code=status.HTTP_200_OK)
-async def health_check(db: AsyncSession = Depends(get_db)):
+@app.get("/", tags=["Root"])
+async def root():
     """
-    Performs a health check of the API and its database connection.
+    Root endpoint for health checks and service discovery.
     """
-    try:
-        await db.execute(text("SELECT 1"))
-        return {"status": "ok", "database_connection": "ok"}
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"status": "error", "database_connection": "failed"}
-        )
+    return {"status": "ok", "service": settings.PROJECT_NAME, "version": "1.0"}
+
+# Note: In a production deployment, this application would be run by a server like Uvicorn:
+# uvicorn main:app --host 0.0.0.0 --port 8000
+# It's also recommended to create an initial user via a separate CLI script.
+# Example CLI command for user creation:
+# `from db.session import AsyncSessionLocal; from crud import crud_user; from schemas.user import UserCreate; import asyncio; async def create_user(): async with AsyncSessionLocal() as db: user = await crud_user.create(db, obj_in=UserCreate(email="admin@example.com", password="a_very_secure_password", full_name="Admin User", role="admin")); print(user.id); asyncio.run(create_user())`
+
 ```
