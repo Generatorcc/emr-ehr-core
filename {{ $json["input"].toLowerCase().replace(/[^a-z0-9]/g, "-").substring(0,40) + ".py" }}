@@ -1,480 +1,637 @@
 ```python
-# /core/config.py
+#
+# EMR Backend: Secure Patient Document Upload
+#
+# This system provides a HIPAA-compliant API endpoint for uploading patient-related
+# documents. It uses FastAPI, Pydantic, and SQLAlchemy, with JWT for
+# authentication and role-based access control. Documents are stored in an
+# encrypted AWS S3 bucket, and all actions are logged for auditing purposes.
+#
+
+# --- core/config.py ---
+
 import os
 from pydantic_settings import BaseSettings
-from typing import Set
+from functools import lru_cache
 
 class Settings(BaseSettings):
     """
-    Application-wide settings managed by Pydantic.
-    Values are loaded from environment variables.
+    Application configuration settings loaded from environment variables.
     """
-    PROJECT_NAME: str = "EMR Backend System"
+    # Application settings
+    PROJECT_NAME: str = "EMR_DOCUMENT_SERVICE"
     API_V1_STR: str = "/api/v1"
 
-    # Security
-    SECRET_KEY: str
+    # Security settings
+    # To generate a new secret: `openssl rand -hex 32`
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7")
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
-    # A set of allowed file content types for uploads
-    ALLOWED_CONTENT_TYPES: Set[str] = {"application/pdf", "image/tiff", "application/dicom"}
-    MAX_FILE_SIZE_MB: int = 50
 
-    # Database
-    DATABASE_URL: str
+    # Database settings
+    # Example: postgresql+asyncpg://user:password@host:port/dbname
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://emr_user:secure_password@localhost:5432/emr_db")
 
-    # AWS S3 for Encrypted Storage
-    S3_BUCKET_NAME: str
-    S3_REGION: str
-    AWS_ACCESS_KEY_ID: str
-    AWS_SECRET_ACCESS_KEY: str
-    # Set to 'AES256' for SSE-S3 or the KMS Key ID for SSE-KMS
-    S3_SERVER_SIDE_ENCRYPTION: str = "AES256"
+    # AWS S3 settings for document storage
+    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "emr-patient-documents-secure-bucket")
+    S3_AWS_REGION: str = os.getenv("S3_AWS_REGION", "us-east-1")
+    S3_AWS_ACCESS_KEY_ID: str = os.getenv("S3_AWS_ACCESS_KEY_ID", "minioadmin")
+    S3_AWS_SECRET_ACCESS_KEY: str = os.getenv("S3_AWS_SECRET_ACCESS_KEY", "minioadmin")
+    # Use MinIO for local development if S3_ENDPOINT_URL is set
+    S3_ENDPOINT_URL: str | None = os.getenv("S3_ENDPOINT_URL", None) 
 
     class Config:
         case_sensitive = True
         env_file = ".env"
 
-settings = Settings()
+@lru_cache()
+def get_settings():
+    return Settings()
 
-# /db/database.py
-import databases
-from sqlalchemy import create_engine, MetaData
+# --- db/base_class.py ---
 
-DATABASE_URL = settings.DATABASE_URL
-database = databases.Database(DATABASE_URL)
-metadata = MetaData()
-engine = create_engine(DATABASE_URL)
+from sqlalchemy.ext.declarative import as_declarative, declared_attr
 
-# /db/models.py
-import uuid
-from sqlalchemy import (
-    Table, Column, String, DateTime, Boolean,
-    ForeignKey, Enum as SQLAlchemyEnum, JSON
+@as_declarative()
+class Base:
+    """Base class for SQLAlchemy models."""
+    id: any
+    __name__: str
+
+    # Generate __tablename__ automatically
+    @declared_attr
+    def __tablename__(cls) -> str:
+        return cls.__name__.lower()
+
+# --- db/session.py ---
+
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+
+settings = get_settings()
+
+engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True, echo=False)
+AsyncSessionLocal = sessionmaker(
+    autocommit=False, 
+    autoflush=False, 
+    bind=engine, 
+    class_=AsyncSession,
+    expire_on_commit=False,
 )
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.sql import func
-from .database import metadata
+
+async def get_db() -> AsyncSession:
+    """Dependency to get an async database session."""
+    async with AsyncSessionLocal() as session:
+        yield session
+
+# --- models/user.py ---
+
 import enum
+from sqlalchemy import Column, Integer, String, Boolean, Enum
+from db.base_class import Base
 
 class UserRole(str, enum.Enum):
     ADMIN = "admin"
     CLINICIAN = "clinician"
-    NURSE = "nurse"
     PATIENT = "patient"
-    SYSTEM = "system"
 
-class AuditAction(str, enum.Enum):
-    CREATE = "CREATE"
-    READ = "READ"
-    UPDATE = "UPDATE"
-    DELETE = "DELETE"
-    LOGIN_SUCCESS = "LOGIN_SUCCESS"
-    LOGIN_FAIL = "LOGIN_FAIL"
-    UPLOAD = "UPLOAD"
-    DOWNLOAD = "DOWNLOAD"
+class User(Base):
+    """Database model for a user."""
+    id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String(255), nullable=False)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    role = Column(Enum(UserRole), nullable=False)
+    is_active = Column(Boolean(), default=True)
 
-users = Table(
-    "users",
-    metadata,
-    Column("id", UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
-    Column("username", String(255), unique=True, index=True, nullable=False),
-    Column("email", String(255), unique=True, index=True, nullable=False),
-    Column("hashed_password", String(255), nullable=False),
-    Column("full_name", String(255), nullable=True),
-    Column("roles", JSON, nullable=False, default=[]), # Stores a list of UserRole strings
-    Column("is_active", Boolean, default=True),
-    Column("created_at", DateTime(timezone=True), server_default=func.now()),
-    Column("updated_at", DateTime(timezone=True), onupdate=func.now()),
-)
 
-medical_documents = Table(
-    "medical_documents",
-    metadata,
-    Column("id", UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
-    Column("patient_id", UUID(as_uuid=True), index=True, nullable=False),
-    Column("uploader_user_id", UUID(as_uuid=True), ForeignKey("users.id"), nullable=False),
-    Column("document_type", String(100), nullable=False),
-    Column("original_filename", String(255), nullable=False),
-    Column("content_type", String(100), nullable=False),
-    Column("s3_object_key", String(1024), unique=True, nullable=False),
-    Column("file_size_bytes", String, nullable=False),
-    Column("upload_timestamp", DateTime(timezone=True), server_default=func.now()),
-)
+# --- models/document.py ---
 
-audit_logs = Table(
-    "audit_logs",
-    metadata,
-    Column("id", UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
-    Column("user_id", UUID(as_uuid=True), ForeignKey("users.id"), nullable=True), # Can be null for system events
-    Column("action", SQLAlchemyEnum(AuditAction), nullable=False),
-    Column("target_resource_type", String(100), nullable=True),
-    Column("target_resource_id", String, nullable=True),
-    Column("timestamp", DateTime(timezone=True), server_default=func.now()),
-    Column("details", JSON, nullable=True), # e.g., IP address, user agent
-    Column("status", String(50), nullable=False), # e.g., 'SUCCESS', 'FAILURE'
-)
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, BigInteger
+from sqlalchemy.sql import func
+from db.base_class import Base
 
-# /schemas/token.py
+class Document(Base):
+    """Database model for a patient document."""
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, index=True, nullable=False)
+    uploader_user_id = Column(Integer, ForeignKey("user.id"), nullable=False)
+    file_name = Column(String(255), nullable=False)
+    s3_bucket = Column(String(255), nullable=False)
+    s3_key = Column(String(255), unique=True, nullable=False)
+    mime_type = Column(String(100), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# --- models/audit_log.py ---
+
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.sql import func
+from db.base_class import Base
+
+class AuditLog(Base):
+    """Database model for audit trail entries."""
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    user_id = Column(Integer, ForeignKey("user.id"), nullable=True) # Nullable for system events
+    action = Column(String(255), nullable=False)
+    target_resource_type = Column(String(100), nullable=True)
+    target_resource_id = Column(String(255), nullable=True)
+    details = Column(JSONB) # Store additional context as JSON
+    client_ip_address = Column(String(45), nullable=True)
+
+
+# --- schemas/token.py ---
+
 from pydantic import BaseModel
 from typing import Optional
-import uuid
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
 class TokenData(BaseModel):
-    username: Optional[str] = None
-    user_id: Optional[uuid.UUID] = None
+    user_id: Optional[int] = None
+    role: Optional[str] = None
 
-# /schemas/user.py
-import uuid
+
+# --- schemas/user.py ---
+
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional
-from datetime import datetime
-from db.models import UserRole
+from models.user import UserRole
 
 class UserBase(BaseModel):
-    username: str
     email: EmailStr
-    full_name: Optional[str] = None
+    full_name: str
+    role: UserRole
 
-class UserInDBBase(UserBase):
-    id: uuid.UUID
-    roles: List[UserRole]
+class UserCreate(UserBase):
+    password: str
+
+class UserInDB(UserBase):
+    id: int
     is_active: bool
-    created_at: datetime
-    updated_at: Optional[datetime] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
-class User(UserInDBBase):
-    pass
+# --- schemas/audit_log.py ---
 
-class UserInDB(UserInDBBase):
-    hashed_password: str
+from pydantic import BaseModel
+from typing import Optional, Any, Dict
 
-# /schemas/document.py
-import uuid
-from pydantic import BaseModel, Field
+class AuditLogCreate(BaseModel):
+    user_id: Optional[int] = None
+    action: str
+    target_resource_type: Optional[str] = None
+    target_resource_id: Optional[str] = None
+    details: Dict[str, Any] = {}
+    client_ip_address: Optional[str] = None
+
+# --- schemas/document.py ---
+
+from pydantic import BaseModel
 from datetime import datetime
 
-class DocumentUploadResponse(BaseModel):
-    id: uuid.UUID
-    patient_id: uuid.UUID
-    s3_object_key: str
-    upload_timestamp: datetime
-    message: str = "Document uploaded successfully"
+class DocumentBase(BaseModel):
+    file_name: str
+    mime_type: str
+    size_bytes: int
 
-class DocumentMetadata(BaseModel):
-    id: uuid.UUID
-    patient_id: uuid.UUID
-    uploader_user_id: uuid.UUID
-    document_type: str
-    original_filename: str
-    content_type: str
-    s3_object_key: str
-    file_size_bytes: str
-    upload_timestamp: datetime
+class DocumentCreate(BaseModel):
+    patient_id: int
+    uploader_user_id: int
+    file_name: str
+    s3_bucket: str
+    s3_key: str
+    mime_type: str
+    size_bytes: int
+
+class DocumentResponse(BaseModel):
+    id: int
+    patient_id: int
+    uploader_user_id: int
+    file_name: str
+    s3_bucket: str
+    mime_type: str
+    size_bytes: int
+    created_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
-# /services/audit_service.py
-import uuid
-from fastapi import Request
-from db.database import database
-from db.models import audit_logs, AuditAction
 
-class AuditService:
-    @staticmethod
-    async def log_event(
-        user_id: uuid.UUID,
-        action: AuditAction,
-        status: str,
-        target_resource_type: str,
-        target_resource_id: str,
-        request: Request
-    ):
-        """Creates an audit log entry."""
-        details = {
-            "ip_address": request.client.host,
-            "user_agent": request.headers.get("user-agent"),
-        }
-        query = audit_logs.insert().values(
-            user_id=user_id,
-            action=action,
-            status=status,
-            target_resource_type=target_resource_type,
-            target_resource_id=target_resource_id,
-            details=details,
-        )
-        await database.execute(query)
+# --- crud/base.py ---
 
-audit_service = AuditService()
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from db.base_class import Base
 
-# /services/s3_service.py
+ModelType = TypeVar("ModelType", bound=Base)
+CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
+
+class CRUDBase(Generic[ModelType, CreateSchemaType]):
+    def __init__(self, model: Type[ModelType]):
+        self.model = model
+
+    async def get(self, db: AsyncSession, id: Any) -> Optional[ModelType]:
+        result = await db.execute(select(self.model).filter(self.model.id == id))
+        return result.scalars().first()
+
+    async def create(self, db: AsyncSession, *, obj_in: CreateSchemaType) -> ModelType:
+        obj_in_data = obj_in.model_dump()
+        db_obj = self.model(**obj_in_data)
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
+
+
+# --- crud/crud_user.py ---
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from crud.base import CRUDBase
+from models.user import User
+from schemas.user import UserCreate
+
+class CRUDUser(CRUDBase[User, UserCreate]):
+    async def get_by_email(self, db: AsyncSession, *, email: str) -> User | None:
+        result = await db.execute(select(User).filter(User.email == email))
+        return result.scalars().first()
+
+crud_user = CRUDUser(User)
+
+# --- crud/crud_document.py ---
+
+from crud.base import CRUDBase
+from models.document import Document
+from schemas.document import DocumentCreate
+
+class CRUDDocument(CRUDBase[Document, DocumentCreate]):
+    pass
+
+crud_document = CRUDDocument(Document)
+
+# --- crud/crud_audit.py ---
+
+from crud.base import CRUDBase
+from models.audit_log import AuditLog
+from schemas.audit_log import AuditLogCreate
+
+class CRUDAuditLog(CRUDBase[AuditLog, AuditLogCreate]):
+    async def log_action(self, db: AsyncSession, *, log_in: AuditLogCreate) -> AuditLog:
+        return await self.create(db, obj_in=log_in)
+
+crud_audit = CRUDAuditLog(AuditLog)
+
+# --- services/s3_service.py ---
+
 import boto3
+from botocore.client import Config
 from botocore.exceptions import ClientError
-from fastapi import UploadFile
-from core.config import settings
+from fastapi import UploadFile, HTTPException, status
+import logging
+
+settings = get_settings()
+logger = logging.getLogger(__name__)
 
 class S3Service:
     def __init__(self):
         self.s3_client = boto3.client(
             's3',
-            region_name=settings.S3_REGION,
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY
+            aws_access_key_id=settings.S3_AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.S3_AWS_SECRET_ACCESS_KEY,
+            region_name=settings.S3_AWS_REGION,
+            endpoint_url=settings.S3_ENDPOINT_URL,
+            config=Config(signature_version='s3v4')
         )
         self.bucket_name = settings.S3_BUCKET_NAME
-        self.sse = settings.S3_SERVER_SIDE_ENCRYPTION
 
-    async def upload_file(self, file: UploadFile, object_key: str) -> bool:
+    def upload_file(self, file: UploadFile, s3_key: str) -> None:
         """
         Uploads a file to an S3 bucket with server-side encryption.
         """
         try:
-            extra_args = {'ServerSideEncryption': self.sse}
             self.s3_client.upload_fileobj(
                 file.file,
                 self.bucket_name,
-                object_key,
-                ExtraArgs=extra_args
+                s3_key,
+                ExtraArgs={
+                    "ServerSideEncryption": "AES256",
+                    "ContentType": file.content_type
+                }
             )
-        except ClientError:
-            # In a real system, log this error securely
-            return False
-        return True
+        except ClientError as e:
+            logger.error(f"S3 Upload Error for key {s3_key}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Could not upload file to secure storage.",
+            )
 
 s3_service = S3Service()
 
-# /security/authentication.py
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+# --- core/security.py ---
+
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from pydantic import ValidationError
-import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.config import settings
-from db.database import database
-from db.models import users, UserRole
+from core.config import get_settings
+from db.session import get_db
+from models.user import User, UserRole
 from schemas.token import TokenData
-from schemas.user import User
-from services.audit_service import audit_service, AuditAction
+from crud.crud_user import crud_user
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+settings = get_settings()
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/token")
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
+        expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
-    # Ensure UUID is converted to string for JWT payload
-    if 'user_id' in to_encode and isinstance(to_encode['user_id'], uuid.UUID):
-        to_encode['user_id'] = str(to_encode['user_id'])
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 
-async def get_user(username: str) -> Optional[User]:
-    query = users.select().where(users.c.username == username)
-    user_record = await database.fetch_one(query)
-    if user_record:
-        return User.from_orm(user_record)
-    return None
-
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
+async def get_current_user(
+    db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme)
+) -> User:
+    """
+    Dependency to get the current user from a JWT token.
+    Raises credentials_exception if token is invalid or user not found.
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
+        payload = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+        )
+        user_id: int = payload.get("sub")
+        if user_id is None:
             raise credentials_exception
-        token_data = TokenData(username=username)
-    except (JWTError, ValidationError):
+        token_data = TokenData(user_id=user_id)
+    except JWTError:
         raise credentials_exception
     
-    user = await get_user(username=token_data.username)
+    user = await crud_user.get(db, id=token_data.user_id)
     if user is None:
         raise credentials_exception
     return user
 
-async def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
+async def get_current_active_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """
+    Dependency to get the current active user.
+    Raises an exception if the user is inactive.
+    """
     if not current_user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
     return current_user
 
-def require_role(required_roles: List[UserRole]):
+def authorize_role(allowed_roles: list[UserRole]):
     """
-    Dependency to enforce role-based access control (RBAC).
+    Dependency factory to authorize based on user role.
     """
-    async def role_checker(request: Request, current_user: User = Depends(get_current_active_user)) -> User:
-        user_roles = set(current_user.roles)
-        if not any(role in user_roles for role in required_roles):
-            # Audit the authorization failure
-            await audit_service.log_event(
-                user_id=current_user.id,
-                action=AuditAction.UPDATE,
-                status="FAILURE",
-                target_resource_type="document_upload",
-                target_resource_id=None,
-                request=request
-            )
+    def role_checker(current_user: User = Depends(get_current_active_user)) -> User:
+        if current_user.role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="The user does not have the required permissions.",
+                detail="The user does not have sufficient privileges for this resource."
             )
         return current_user
     return role_checker
 
-# /api/v1/endpoints/documents.py
-import uuid
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Request
-from sqlalchemy.dialects.postgresql import insert
-from core.config import settings
-from db.database import database
-from db.models import medical_documents, UserRole
-from schemas.document import DocumentUploadResponse
-from schemas.user import User
-from security.authentication import require_role
-from services.s3_service import s3_service
-from services.audit_service import audit_service, AuditAction
+# --- api/v1/endpoints/auth.py ---
 
-router = APIRouter()
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import timedelta
 
-@router.post(
-    "/upload",
-    response_model=DocumentUploadResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Upload a Patient Medical Document",
-    description="Securely uploads a medical document to encrypted storage and records metadata in the EMR.",
-)
-async def upload_document(
-    request: Request,
-    patient_id: uuid.UUID = Form(...),
-    document_type: str = Form(...),
-    file: UploadFile = File(...),
-    current_user: User = Depends(require_role([UserRole.CLINICIAN, UserRole.NURSE, UserRole.ADMIN])),
+from db.session import get_db
+from core.security import create_access_token, verify_password
+from crud.crud_user import crud_user
+from schemas.token import Token
+
+auth_router = APIRouter()
+
+@auth_router.post("/token", response_model=Token)
+async def login_for_access_token(
+    db: AsyncSession = Depends(get_db), 
+    form_data: OAuth2PasswordRequestForm = Depends()
 ):
     """
-    Endpoint to upload a medical document for a patient.
-
-    - **Requires Authentication**: Valid JWT for an active user.
-    - **Requires Authorization**: User must have 'clinician', 'nurse', or 'admin' role.
-    - **File Validation**: Checks content type and size against configured limits.
-    - **Storage**: File is stored in an encrypted S3 bucket.
-    - **Database**: Metadata is saved to the 'medical_documents' table.
-    - **Auditing**: The upload action is logged.
+    OAuth2 compatible token login, get an access token for future requests.
     """
-    # 1. Input Validation
-    if file.content_type not in settings.ALLOWED_CONTENT_TYPES:
+    user = await crud_user.get_by_email(db, email=form_data.username)
+    if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Unsupported file type. Allowed types are: {', '.join(settings.ALLOWED_CONTENT_TYPES)}",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
 
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user.id), "role": user.role.value},
+        expires_delta=access_token_expires,
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+# --- api/v1/endpoints/documents.py ---
+
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from db.session import get_db
+from models.user import User, UserRole
+from schemas.document import DocumentResponse, DocumentCreate
+from schemas.audit_log import AuditLogCreate
+from crud.crud_document import crud_document
+from crud.crud_audit import crud_audit
+from core.security import get_current_active_user, authorize_role
+from services.s3_service import s3_service
+
+documents_router = APIRouter()
+ALLOWED_MIME_TYPES = ["application/pdf", "image/jpeg", "image/png", "text/plain"]
+MAX_FILE_SIZE_MB = 10
+
+def get_file_size_bytes(file: UploadFile) -> int:
+    """Safely get file size from an UploadFile object."""
     file.file.seek(0, 2)
-    file_size = file.file.tell()
-    await file.seek(0)
-    if file_size > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+    size = file.file.tell()
+    file.file.seek(0)
+    return size
+
+async def log_upload_action(
+    db: AsyncSession,
+    user: User,
+    request: Request,
+    document: DocumentResponse
+):
+    """Asynchronous background task to log the document upload event."""
+    log_entry = AuditLogCreate(
+        user_id=user.id,
+        action="DOCUMENT_UPLOAD",
+        target_resource_type="Document",
+        target_resource_id=str(document.id),
+        client_ip_address=request.client.host,
+        details={
+            "patient_id": document.patient_id,
+            "filename": document.file_name,
+            "s3_bucket": document.s3_bucket,
+            "mime_type": document.mime_type,
+            "size_bytes": document.size_bytes,
+        }
+    )
+    # This must use a new session as the original request session is closed.
+    async with AsyncSessionLocal() as session:
+        await crud_audit.log_action(db=session, log_in=log_entry)
+
+
+@documents_router.post(
+    "/patients/{patient_id}/documents",
+    response_model=DocumentResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(authorize_role([UserRole.ADMIN, UserRole.CLINICIAN]))]
+)
+async def upload_patient_document(
+    patient_id: int,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Uploads a document for a specific patient.
+
+    Requires authentication and authorization (Admin or Clinician roles).
+    - Validates file type and size.
+    - Uploads file to a secure, encrypted S3 bucket.
+    - Creates a metadata record in the database.
+    - Creates an audit log entry for the action.
+    """
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid file type. Allowed types: {', '.join(ALLOWED_MIME_TYPES)}"
+        )
+    
+    file_size_bytes = get_file_size_bytes(file)
+    if file_size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size exceeds the limit of {settings.MAX_FILE_SIZE_MB}MB.",
+            detail=f"File size exceeds the limit of {MAX_FILE_SIZE_MB} MB."
         )
 
-    # 2. Generate secure, unique object key for S3
-    file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'bin'
-    s3_object_key = f"patients/{patient_id}/documents/{uuid.uuid4()}.{file_extension}"
+    # In a real system, you would verify that the `patient_id` is valid
+    # and that the `current_user` has privileges for this specific patient.
+    # e.g., `await crud.patient.verify_access(db, user=current_user, patient_id=patient_id)`
     
-    # 3. Upload to encrypted S3
-    upload_successful = await s3_service.upload_file(file=file, object_key=s3_object_key)
+    s3_key = f"patients/{patient_id}/{uuid.uuid4()}-{file.filename}"
+    
+    try:
+        s3_service.upload_file(file=file, s3_key=s3_key)
+    finally:
+        await file.close()
 
-    if not upload_successful:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to upload file to storage service.",
-        )
-
-    # 4. Insert metadata into the database within a transaction
-    document_id = uuid.uuid4()
-    db_insert_query = medical_documents.insert().values(
-        id=document_id,
+    doc_in = DocumentCreate(
         patient_id=patient_id,
         uploader_user_id=current_user.id,
-        document_type=document_type,
-        original_filename=file.filename,
-        content_type=file.content_type,
-        s3_object_key=s3_object_key,
-        file_size_bytes=str(file_size)
+        file_name=file.filename,
+        s3_bucket=settings.S3_BUCKET_NAME,
+        s3_key=s3_key,
+        mime_type=file.content_type,
+        size_bytes=file_size_bytes
+    )
+    
+    db_document = await crud_document.create(db=db, obj_in=doc_in)
+    
+    # Use response model to format output before passing to background task
+    document_response = DocumentResponse.model_validate(db_document)
+
+    background_tasks.add_task(
+        log_upload_action, db, current_user, request, document_response
     )
 
-    try:
-        async with database.transaction():
-             await database.execute(db_insert_query)
-    except Exception as e:
-        # In a real system, add structured logging here
-        # Attempt to clean up the orphaned S3 file if DB write fails
-        # s3_service.delete_file(s3_object_key)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to record document metadata.",
-        )
+    return document_response
 
-    # 5. Log the successful audit event
-    await audit_service.log_event(
-        user_id=current_user.id,
-        action=AuditAction.UPLOAD,
-        status="SUCCESS",
-        target_resource_type="medical_document",
-        target_resource_id=str(document_id),
-        request=request,
-    )
+# --- api/v1/api.py ---
 
-    # 6. Return success response
-    record = await database.fetch_one(medical_documents.select().where(medical_documents.c.id == document_id))
-
-    return DocumentUploadResponse.from_orm(record)
-
-# /api/v1/api.py
 from fastapi import APIRouter
-from api.v1.endpoints import documents
+from api.v1.endpoints import documents, auth
 
 api_router = APIRouter()
-api_router.include_router(documents.router, prefix="/documents", tags=["Documents"])
+api_router.include_router(auth.auth_router, prefix="/auth", tags=["Authentication"])
+api_router.include_router(documents.documents_router, prefix="/documents", tags=["Patient Documents"])
 
-# /main.py
+
+# --- main.py ---
+
 from fastapi import FastAPI
-from db.database import database
-from core.config import settings
+from starlette.middleware.cors import CORSMiddleware
+from core.config import get_settings
 from api.v1.api import api_router
+
+settings = get_settings()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    description="Backend for a secure, HIPAA-compliant EMR system.",
+    version="1.0.0"
 )
 
-@app.on_event("startup")
-async def startup():
-    await database.connect()
-
-@app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
+# Set all CORS enabled origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For production, restrict this to trusted domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
-@app.get("/", include_in_schema=False)
-def read_root():
-    return {"status": "EMR Service is operational"}
+@app.get("/", tags=["Root"])
+async def read_root():
+    """An endpoint to verify the service is running."""
+    return {"status": "EMR Backend Service is operational."}
 
+# To run this application:
+# 1. Install dependencies:
+#    pip install "fastapi[all]" "sqlalchemy[asyncio]" asyncpg pydantic-settings python-jose[cryptography] passlib[bcrypt] boto3
+# 2. Set up environment variables in a .env file (see core/config.py)
+# 3. Run with uvicorn:
+#    uvicorn main:app --reload
+#
+# A one-time setup script would be needed to create initial users in the database.
 ```
