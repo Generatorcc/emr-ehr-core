@@ -1,211 +1,223 @@
 ```python
-#
-# EMR Backend Service: Patient Demographics Management
-#
-# This service provides secure, HIPAA-compliant CRUD operations for patient
-# demographic data. It includes JWT-based authentication, role-based access
-# control, and comprehensive audit logging for all PHI access.
-#
-# File Structure:
-# /
-# ├── main.py
-# ├── api/
-# │   └── v1/
-# │       ├── api.py
-# │       └── endpoints/
-# │           ├── patients.py
-# │           └── auth.py
-# ├── core/
-# │   ├── config.py
-# │   └── security.py
-# ├── crud/
-# │   ├── crud_audit.py
-# │   └── crud_patient.py
-# │   └── crud_user.py
-# ├── db/
-# │   └── session.py
-# ├── models/
-# │   ├── audit_log.py
-# │   ├── patient.py
-# │   └── user.py
-# └── schemas/
-#     ├── audit_log.py
-#     ├── patient.py
-#     ├── token.py
-#     └── user.py
-#
+# /core/config.py
 
-# --- /core/config.py ---
-# Description: Manages application settings and secrets using Pydantic's BaseSettings.
-#
 import os
 from pydantic_settings import BaseSettings
 from typing import List
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
-    PROJECT_NAME: str = "EMR_Backend_Service"
+    """
+    Manages application configuration using environment variables.
+    """
     API_V1_STR: str = "/api/v1"
     
-    # Security settings
-    # In production, use a strong, randomly generated secret.
-    # e.g., openssl rand -hex 32
-    SECRET_KEY: str = os.environ.get("SECRET_KEY", "b4f2c815b3a3a4b9e8f1a1c3d5a7b9e2d7f8c6a5b3e4d2c1a0b9e8f7d6e5c4a3")
+    # JWT Settings
+    SECRET_KEY: str = os.environ.get("SECRET_KEY", "fallback_secret_for_dev_only_6a2b8e3d4c5f")
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    
-    # Database settings
-    # Ensure the PostgreSQL server is configured for encryption at rest.
-    # Format: postgresql+asyncpg://user:password@host:port/dbname
-    DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql+asyncpg://emr_user:secure_password@localhost:5432/emr_db")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
-    # Allowed user roles for PHI access
-    # This enforces role-based access control.
-    PHI_ACCESS_ROLES: List[str] = ["clinician", "admin"]
-    
+    # Database Settings
+    POSTGRES_SERVER: str = os.environ.get("POSTGRES_SERVER", "localhost")
+    POSTGRES_USER: str = os.environ.get("POSTGRES_USER", "postgres")
+    POSTGRES_PASSWORD: str = os.environ.get("POSTGRES_PASSWORD", "password")
+    POSTGRES_DB: str = os.environ.get("POSTGRES_DB", "emr_db")
+    DATABASE_URI: str = f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_SERVER}/{POSTGRES_DB}"
+
+    # S3 Storage Settings (assumes IAM role for production)
+    S3_BUCKET_NAME: str = os.environ.get("S3_BUCKET_NAME", "emr-clinical-documents-dev")
+    S3_REGION: str = os.environ.get("S3_REGION", "us-east-1")
+    S3_ACCESS_KEY_ID: str | None = os.environ.get("S3_ACCESS_KEY_ID")
+    S3_SECRET_ACCESS_KEY: str | None = os.environ.get("S3_SECRET_ACCESS_KEY")
+    S3_PRESIGNED_URL_EXPIRATION: int = 3600  # seconds
+
+    # User Roles
+    USER_ROLES: List[str] = ["clinician", "nurse", "admin", "patient"]
+
     class Config:
         case_sensitive = True
 
 settings = Settings()
 
+```
 
-# --- /db/session.py ---
-# Description: Handles database session management and engine creation.
-#
+```python
+# /db/session.py
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import sessionmaker
 from core.config import settings
 
-# The async engine allows for non-blocking database operations.
-async_engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True, echo=False)
-
-# The sessionmaker provides a factory for creating new AsyncSession objects.
+engine = create_async_engine(settings.DATABASE_URI, pool_pre_ping=True, echo=False)
 AsyncSessionLocal = sessionmaker(
-    bind=async_engine,
+    autocommit=False, 
+    autoflush=False, 
+    bind=engine, 
     class_=AsyncSession,
-    expire_on_commit=False,
-    autocommit=False,
-    autoflush=False
+    expire_on_commit=False
 )
 
-# Base class for declarative SQLAlchemy models.
-Base = declarative_base()
-
-async def get_db_session() -> AsyncSession:
-    """Dependency to get a database session for a single request."""
+async def get_db() -> AsyncSession:
+    """
+    FastAPI dependency to provide a database session.
+    """
     async with AsyncSessionLocal() as session:
         yield session
 
+```
 
-# --- /models/user.py ---
-# Description: SQLAlchemy model for system users (e.g., clinicians, admins).
-#
+```python
+# /db/base_class.py
+
+from typing import Any
+from sqlalchemy.ext.declarative import as_declarative, declared_attr
+
+@as_declarative()
+class Base:
+    """
+    Base class for SQLAlchemy models.
+    """
+    id: Any
+    __name__: str
+    
+    @declared_attr
+    def __tablename__(cls) -> str:
+        return cls.__name__.lower() + "s"
+
+```
+
+```python
+# /models/user.py
+
 import uuid
-from sqlalchemy import Column, String, DateTime, func, Boolean
+from sqlalchemy import Column, String, DateTime, func, Enum
 from sqlalchemy.dialects.postgresql import UUID
-from db.session import Base
+from sqlalchemy.orm import relationship
+from db.base_class import Base
+from core.config import settings
 
 class User(Base):
-    """Represents a system user with credentials and role."""
-    __tablename__ = "users"
-    
+    """
+    User model representing a clinician, staff member, or admin.
+    """
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    username = Column(String(255), unique=True, index=True, nullable=False)
+    full_name = Column(String(255), nullable=False)
+    username = Column(String(100), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
-    full_name = Column(String(255), nullable=True)
-    role = Column(String(50), nullable=False, index=True) # e.g., 'clinician', 'admin', 'billing'
-    is_active = Column(Boolean, default=True, nullable=False)
+    role = Column(Enum(*settings.USER_ROLES, name="user_roles_enum"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
+    uploaded_documents = relationship("ClinicalDocument", back_populates="uploader")
+    audit_logs = relationship("AuditLog", back_populates="user")
 
-# --- /models/patient.py ---
-# Description: SQLAlchemy model for patient demographic data.
-#
+```
+
+```python
+# /models/patient.py
+
 import uuid
-from sqlalchemy import Column, String, Date, DateTime, func, Enum
+from sqlalchemy import Column, String, Date, DateTime, func
 from sqlalchemy.dialects.postgresql import UUID
-from db.session import Base
-import enum
-
-class Gender(str, enum.Enum):
-    MALE = "Male"
-    FEMALE = "Female"
-    OTHER = "Other"
-    UNKNOWN = "Unknown"
+from sqlalchemy.orm import relationship
+from db.base_class import Base
 
 class Patient(Base):
-    """Represents patient demographic information (PHI)."""
-    __tablename__ = "patients"
-
+    """
+    Patient model.
+    """
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    mrn = Column(String(50), unique=True, index=True, nullable=False) # Medical Record Number
     first_name = Column(String(255), nullable=False)
     last_name = Column(String(255), nullable=False)
     date_of_birth = Column(Date, nullable=False)
-    gender = Column(Enum(Gender), nullable=False)
-    contact_phone = Column(String(50), nullable=True)
-    contact_email = Column(String(255), nullable=True)
-    address_line1 = Column(String(255), nullable=True)
-    address_line2 = Column(String(255), nullable=True)
-    city = Column(String(100), nullable=True)
-    state = Column(String(100), nullable=True)
-    postal_code = Column(String(20), nullable=True)
-    
+    mrn = Column(String(50), unique=True, index=True, nullable=False) # Medical Record Number
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
+    documents = relationship("ClinicalDocument", back_populates="patient")
 
-# --- /models/audit_log.py ---
-# Description: SQLAlchemy model for HIPAA audit trails.
-#
+```
+
+```python
+# /models/document.py
+
 import uuid
-from sqlalchemy import Column, String, DateTime, func, JSON
+from sqlalchemy import Column, String, DateTime, func, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.sql.schema import ForeignKey
-from db.session import Base
+from sqlalchemy.orm import relationship
+from db.base_class import Base
+
+class ClinicalDocument(Base):
+    """
+    Metadata for a clinical document stored in S3.
+    """
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False, index=True)
+    uploader_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    
+    file_name = Column(String(255), nullable=False)
+    s3_key = Column(String(1024), unique=True, nullable=False)
+    mime_type = Column(String(100), nullable=False)
+    file_hash = Column(String(256), nullable=False) # SHA-256 hash of the file
+    description = Column(String(500), nullable=True)
+
+    upload_timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+    patient = relationship("Patient", back_populates="documents")
+    uploader = relationship("User", back_populates="uploaded_documents")
+
+```
+
+```python
+# /models/audit_log.py
+
+import uuid
+from sqlalchemy import Column, String, DateTime, func, ForeignKey, JSON
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from db.base_class import Base
 
 class AuditLog(Base):
-    """Represents an audit log entry for tracking PHI access and system events."""
-    __tablename__ = "audit_logs"
-
+    """
+    Audit trail for HIPAA compliance, logging significant events.
+    """
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    action = Column(String(255), nullable=False) # e.g., 'VIEW_DOCUMENT', 'UPLOAD_DOCUMENT'
+    details = Column(JSON, nullable=True) # e.g., {'patient_id': '...', 'document_id': '...'}
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    action = Column(String(255), nullable=False, index=True) # e.g., PATIENT_VIEW, PATIENT_UPDATE
-    resource_type = Column(String(100), nullable=True) # e.g., Patient, User
-    resource_id = Column(String(255), nullable=True) # e.g., Patient MRN or UUID
-    details = Column(JSON, nullable=True) # Additional context, like changed fields
-    ip_address = Column(String(50), nullable=True)
-    user_agent = Column(String(500), nullable=True)
-    status = Column(String(50), nullable=False) # e.g., 'SUCCESS', 'FAILURE'
 
+    user = relationship("User", back_populates="audit_logs")
 
-# --- /schemas/token.py ---
-# Description: Pydantic schemas for JWT token data.
-#
+```
+
+```python
+# /schemas/token.py
+
 from pydantic import BaseModel
 from typing import Optional
+import uuid
 
 class Token(BaseModel):
-    """Schema for the access token response."""
     access_token: str
     token_type: str
 
 class TokenData(BaseModel):
-    """Schema for data encoded within the JWT."""
     username: Optional[str] = None
+    user_id: Optional[uuid.UUID] = None
+    role: Optional[str] = None
 
+```
 
-# --- /schemas/user.py ---
-# Description: Pydantic schemas for user data validation.
-#
-import uuid
+```python
+# /schemas/user.py
+
 from pydantic import BaseModel
+import uuid
+from typing import List
+from core.config import settings
 
 class UserBase(BaseModel):
     username: str
-    full_name: Optional[str] = None
+    full_name: str
     role: str
 
 class UserCreate(UserBase):
@@ -213,516 +225,652 @@ class UserCreate(UserBase):
 
 class UserInDB(UserBase):
     id: uuid.UUID
-    is_active: bool
-
-    class Config:
-        from_attributes = True
-
-
-# --- /schemas/audit_log.py ---
-# Description: Pydantic schemas for audit log data.
-#
-import uuid
-from pydantic import BaseModel
-from datetime import datetime
-from typing import Optional, Any
-
-class AuditLogCreate(BaseModel):
-    """Schema for creating a new audit log entry."""
-    user_id: uuid.UUID
-    action: str
-    status: str
-    resource_type: Optional[str] = None
-    resource_id: Optional[str] = None
-    ip_address: Optional[str] = None
-    user_agent: Optional[str] = None
-    details: Optional[dict[str, Any]] = None
-
-
-# --- /schemas/patient.py ---
-# Description: Pydantic schemas for patient data validation and serialization.
-#
-import uuid
-from pydantic import BaseModel, Field
-from datetime import date
-from typing import Optional
-from models.patient import Gender
-
-class PatientBase(BaseModel):
-    """Base schema for patient data, contains all PHI fields."""
-    mrn: str = Field(..., description="Medical Record Number")
-    first_name: str
-    last_name: str
-    date_of_birth: date
-    gender: Gender
-    contact_phone: Optional[str] = None
-    contact_email: Optional[str] = None
-    address_line1: Optional[str] = None
-    address_line2: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    postal_code: Optional[str] = None
-
-class PatientCreate(PatientBase):
-    """Schema for creating a new patient record."""
-    pass
-
-class PatientUpdate(BaseModel):
-    """Schema for updating a patient record. All fields are optional."""
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    date_of_birth: Optional[date] = None
-    gender: Optional[Gender] = None
-    contact_phone: Optional[str] = None
-    contact_email: Optional[str] = None
-    address_line1: Optional[str] = None
-    address_line2: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    postal_code: Optional[str] = None
-
-class PatientInDB(PatientBase):
-    """Schema representing a patient record as stored in the database."""
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
     
     class Config:
         from_attributes = True
 
+```
 
-# --- /core/security.py ---
-# Description: Handles password hashing, JWT creation/decoding, and user authentication.
-#
-from datetime import datetime, timedelta, timezone
-from typing import Optional
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+```python
+# /schemas/audit_log.py
+
+from pydantic import BaseModel
+import uuid
+from datetime import datetime
+from typing import Dict, Any
+
+class AuditLogCreate(BaseModel):
+    user_id: uuid.UUID
+    action: str
+    details: Dict[str, Any]
+
+class AuditLogResponse(AuditLogCreate):
+    id: uuid.UUID
+    timestamp: datetime
+
+    class Config:
+        from_attributes = True
+
+```
+
+```python
+# /schemas/document.py
+
+from pydantic import BaseModel, Field
+import uuid
+from datetime import datetime
+
+class DocumentUploadRequest(BaseModel):
+    patient_id: uuid.UUID
+    file_name: str
+    mime_type: str
+    description: str | None = None
+
+class DocumentUploadURLResponse(BaseModel):
+    upload_url: str
+    s3_key: str
+
+class DocumentCreate(BaseModel):
+    patient_id: uuid.UUID
+    s3_key: str
+    file_name: str
+    mime_type: str
+    file_hash: str = Field(..., pattern=r"^[a-fA-F0-9]{64}$") # SHA-256
+    description: str | None = None
+
+class DocumentResponse(BaseModel):
+    id: uuid.UUID
+    patient_id: uuid.UUID
+    uploader_id: uuid.UUID
+    file_name: str
+    description: str | None = None
+    mime_type: str
+    upload_timestamp: datetime
+
+    class Config:
+        from_attributes = True
+
+class DocumentDownloadURLResponse(BaseModel):
+    download_url: str
+
+```
+
+```python
+# /security/s3_client.py
+
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
 from core.config import settings
+import logging
 
-# Use bcrypt for password hashing
+logger = logging.getLogger(__name__)
+
+class S3Client:
+    """
+    Client for secure interaction with AWS S3.
+    """
+    def __init__(self):
+        self.s3_client = boto3.client(
+            "s3",
+            region_name=settings.S3_REGION,
+            aws_access_key_id=settings.S3_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.S3_SECRET_ACCESS_KEY,
+            config=Config(signature_version="s3v4")
+        )
+        self.bucket_name = settings.S3_BUCKET_NAME
+        self.url_expiration = settings.S3_PRESIGNED_URL_EXPIRATION
+
+    def generate_presigned_upload_url(self, s3_key: str, mime_type: str) -> str | None:
+        """
+        Generates a presigned URL for uploading a file directly to S3.
+        The S3 bucket must have a CORS policy configured.
+        """
+        try:
+            # SSE-S3 requires this header to be set by the client
+            # Or use SSE-KMS by changing ServerSideEncryption and adding KMS key id.
+            params = {
+                "Bucket": self.bucket_name,
+                "Key": s3_key,
+                "ContentType": mime_type,
+                "ServerSideEncryption": "AES256"
+            }
+            url = self.s3_client.generate_presigned_url(
+                ClientMethod="put_object",
+                Params=params,
+                ExpiresIn=self.url_expiration,
+            )
+            return url
+        except ClientError as e:
+            logger.error(f"Failed to generate presigned upload URL: {e}")
+            return None
+
+    def generate_presigned_download_url(self, s3_key: str) -> str | None:
+        """
+        Generates a presigned URL for downloading a file from S3.
+        """
+        try:
+            url = self.s3_client.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": self.bucket_name, "Key": s3_key},
+                ExpiresIn=self.url_expiration,
+            )
+            return url
+        except ClientError as e:
+            logger.error(f"Failed to generate presigned download URL: {e}")
+            return None
+
+s3_client = S3Client()
+
+```
+
+```python
+# /security/password.py
+
+from passlib.context import CryptContext
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verifies a plain password against its hashed version."""
-    return pwd_context.verify(plain_password, hashed_password)
+class PasswordManager:
+    @staticmethod
+    def verify_password(plain_password: str, hashed_password: str) -> bool:
+        return pwd_context.verify(plain_password, hashed_password)
 
-def get_password_hash(password: str) -> str:
-    """Hashes a plain password."""
-    return pwd_context.hash(password)
+    @staticmethod
+    def get_password_hash(password: str) -> str:
+        return pwd_context.hash(password)
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Creates a JWT access token."""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-    return encoded_jwt
+password_manager = PasswordManager()
+```
 
+```python
+# /security/token.py
 
-# --- /crud/crud_user.py ---
-# Description: CRUD operations for the User model.
-#
+from datetime import datetime, timedelta
+from typing import Any, Union
+from jose import jwt
+from core.config import settings
+
+class TokenManager:
+    @staticmethod
+    def create_access_token(
+        subject: Union[str, Any], expires_delta: timedelta = None
+    ) -> str:
+        if expires_delta:
+            expire = datetime.utcnow() + expires_delta
+        else:
+            expire = datetime.utcnow() + timedelta(
+                minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+            )
+        to_encode = {"exp": expire, "sub": str(subject)}
+        encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+        return encoded_jwt
+
+token_manager = TokenManager()
+```
+
+```python
+# /crud/base.py
+
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from models.user import User
-from schemas.user import UserCreate
-from core.security import get_password_hash
-from typing import Optional
+from sqlalchemy import select
+from db.base_class import Base
 
-async def get_user_by_username(db: AsyncSession, username: str) -> Optional[User]:
-    """Retrieves a user by their username."""
-    result = await db.execute(select(User).filter(User.username == username))
-    return result.scalars().first()
+ModelType = TypeVar("ModelType", bound=Base)
+CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
+UpdateSchemaType = TypeVar("UpdateSchemaType", bound=BaseModel)
 
-async def create_user(db: AsyncSession, user: UserCreate) -> User:
-    """Creates a new user in the database."""
-    hashed_password = get_password_hash(user.password)
-    db_user = User(
-        username=user.username,
-        hashed_password=hashed_password,
-        full_name=user.full_name,
-        role=user.role,
-        is_active=True
-    )
-    db.add(db_user)
-    await db.commit()
-    await db.refresh(db_user)
-    return db_user
+class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
+    def __init__(self, model: Type[ModelType]):
+        self.model = model
 
+    async def get(self, db: AsyncSession, id: Any) -> Optional[ModelType]:
+        result = await db.execute(select(self.model).filter(self.model.id == id))
+        return result.scalars().first()
 
-# --- /crud/crud_audit.py ---
-# Description: CRUD operations for the AuditLog model.
-#
-from sqlalchemy.ext.asyncio import AsyncSession
+    async def get_multi(
+        self, db: AsyncSession, *, skip: int = 0, limit: int = 100
+    ) -> List[ModelType]:
+        result = await db.execute(select(self.model).offset(skip).limit(limit))
+        return result.scalars().all()
+
+    async def create(self, db: AsyncSession, *, obj_in: CreateSchemaType) -> ModelType:
+        obj_in_data = obj_in.model_dump()
+        db_obj = self.model(**obj_in_data)
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
+
+```
+
+```python
+# /crud/crud_audit.py
+
+from crud.base import CRUDBase
 from models.audit_log import AuditLog
 from schemas.audit_log import AuditLogCreate
+from sqlalchemy.ext.asyncio import AsyncSession
+import logging
 
-async def create_audit_log(db: AsyncSession, log_entry: AuditLogCreate) -> AuditLog:
-    """Creates a new audit log entry."""
-    db_log = AuditLog(**log_entry.model_dump())
-    db.add(db_log)
-    await db.commit()
-    await db.refresh(db_log)
-    return db_log
+logger = logging.getLogger(__name__)
+
+class CRUDAuditLog(CRUDBase[AuditLog, AuditLogCreate, AuditLogCreate]):
+    async def log_event(self, db: AsyncSession, *, obj_in: AuditLogCreate) -> AuditLog:
+        """
+        Logs an audit event without raising exceptions on failure, to avoid
+        disrupting primary application logic.
+        """
+        try:
+            return await self.create(db=db, obj_in=obj_in)
+        except Exception as e:
+            logger.critical(f"CRITICAL: Failed to write audit log: {e}. Event details: {obj_in.model_dump_json()}")
+            # In a real system, this might trigger a high-priority alert.
+            # We do not re-raise the exception to ensure the user's action completes.
+            return None
 
 
-# --- /crud/crud_patient.py ---
-# Description: CRUD operations for the Patient model.
-#
+crud_audit_log = CRUDAuditLog(AuditLog)
+```
+
+```python
+# /crud/crud_user.py
+
+from typing import Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from crud.base import CRUDBase
+from models.user import User
+from schemas.user import UserCreate
+from security.password import password_manager
+
+class CRUDUser(CRUDBase[User, UserCreate, UserCreate]):
+    async def get_by_username(self, db: AsyncSession, *, username: str) -> Optional[User]:
+        result = await db.execute(select(self.model).filter(self.model.username == username))
+        return result.scalars().first()
+
+    async def create(self, db: AsyncSession, *, obj_in: UserCreate) -> User:
+        db_obj = self.model(
+            username=obj_in.username,
+            full_name=obj_in.full_name,
+            hashed_password=password_manager.get_password_hash(obj_in.password),
+            role=obj_in.role,
+        )
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
+
+crud_user = CRUDUser(User)
+```
+
+```python
+# /crud/crud_document.py
+
+from typing import List
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from models.patient import Patient
-from schemas.patient import PatientCreate, PatientUpdate
-from typing import Optional, Dict, Any
+from sqlalchemy import select
+from crud.base import CRUDBase
+from models.document import ClinicalDocument
+from schemas.document import DocumentCreate
 
-async def get_patient_by_id(db: AsyncSession, patient_id: uuid.UUID) -> Optional[Patient]:
-    """Retrieves a patient by their internal UUID."""
-    result = await db.execute(select(Patient).filter(Patient.id == patient_id))
-    return result.scalars().first()
+class CRUDDocument(CRUDBase[ClinicalDocument, DocumentCreate, DocumentCreate]):
+    async def create_with_uploader(
+        self, db: AsyncSession, *, obj_in: DocumentCreate, uploader_id: uuid.UUID
+    ) -> ClinicalDocument:
+        db_obj = self.model(**obj_in.model_dump(), uploader_id=uploader_id)
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
 
-async def get_patient_by_mrn(db: AsyncSession, mrn: str) -> Optional[Patient]:
-    """Retrieves a patient by their Medical Record Number."""
-    result = await db.execute(select(Patient).filter(Patient.mrn == mrn))
-    return result.scalars().first()
-
-async def create_patient(db: AsyncSession, patient: PatientCreate) -> Patient:
-    """Creates a new patient record."""
-    db_patient = Patient(**patient.model_dump())
-    db.add(db_patient)
-    await db.commit()
-    await db.refresh(db_patient)
-    return db_patient
-
-async def update_patient(db: AsyncSession, db_patient: Patient, patient_in: PatientUpdate) -> Patient:
-    """Updates an existing patient record."""
-    update_data = patient_in.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(db_patient, field, value)
-    await db.commit()
-    await db.refresh(db_patient)
-    return db_patient
-
-def get_patient_update_diff(db_patient: Patient, patient_in: PatientUpdate) -> Dict[str, Any]:
-    """Compares the current patient data with the update data to find changes."""
-    diff = {"changes": []}
-    update_data = patient_in.model_dump(exclude_unset=True)
-    for field, new_value in update_data.items():
-        old_value = getattr(db_patient, field)
-        if str(old_value) != str(new_value):
-            diff["changes"].append({
-                "field": field,
-                "old_value": str(old_value),
-                "new_value": str(new_value)
-            })
-    return diff
-
-
-# --- /api/v1/endpoints/auth.py ---
-# Description: API endpoints for user authentication and token generation.
-#
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import timedelta
-from core.config import settings
-from core.security import create_access_token, verify_password
-from schemas.token import Token
-from schemas.user import UserCreate
-from crud import crud_user
-from db.session import get_db_session
-
-router = APIRouter()
-
-@router.post("/token", response_model=Token, tags=["Authentication"])
-async def login_for_access_token(
-    db: AsyncSession = Depends(get_db_session),
-    form_data: OAuth2PasswordRequestForm = Depends()
-):
-    """Provides a JWT for valid user credentials."""
-    user = await crud_user.get_user_by_username(db, username=form_data.username)
-    if not user or not verify_password(form_data.password, user.hashed_password) or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
+    async def get_multi_by_patient(
+        self, db: AsyncSession, *, patient_id: uuid.UUID, skip: int = 0, limit: int = 100
+    ) -> List[ClinicalDocument]:
+        result = await db.execute(
+            select(self.model)
+            .filter(ClinicalDocument.patient_id == patient_id)
+            .offset(skip)
+            .limit(limit)
         )
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username, "role": user.role}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
+        return result.scalars().all()
 
-@router.post("/users/create", response_model=UserInDB, status_code=status.HTTP_201_CREATED, include_in_schema=False)
-async def create_system_user(user: UserCreate, db: AsyncSession = Depends(get_db_session)):
-    """
-    Endpoint to create system users (e.g., for system setup).
-    In a real system, this would be heavily protected and restricted to super-admins.
-    """
-    db_user = await crud_user.get_user_by_username(db, username=user.username)
-    if db_user:
-        raise HTTPException(status_code=400, detail="Username already registered")
-    return await crud_user.create_user(db=db, user=user)
+crud_document = CRUDDocument(ClinicalDocument)
+```
 
+```python
+# /crud/crud_patient.py
 
-# --- /api/v1/api.py ---
-# Description: Defines API dependencies for security and auditing, and ties routers together.
-#
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from crud.base import CRUDBase
+from models.patient import Patient
+from pydantic import BaseModel
+
+# Placeholder schema for patient creation/update if needed
+class PatientCreate(BaseModel):
+    pass
+
+class PatientUpdate(BaseModel):
+    pass
+
+crud_patient = CRUDBase[Patient, PatientCreate, PatientUpdate](Patient)
+
+```
+
+```python
+# /security/dependencies.py
+
+from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from sqlalchemy.ext.asyncio import AsyncSession
+from jose import jwt, JWTError
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
-from db.session import get_db_session
-from models.user import User as UserModel
+from crud import crud_user
+from db.session import get_db
+from models.user import User
 from schemas.token import TokenData
-from schemas.audit_log import AuditLogCreate
-from crud import crud_user, crud_audit
 
-from api.v1.endpoints import patients, auth
-
-# Main router for API v1
-api_router = APIRouter()
-
-# Authentication scheme
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/token")
+reusable_oauth2 = OAuth2PasswordBearer(
+    tokenUrl=f"{settings.API_V1_STR}/login/access-token"
+)
 
 async def get_current_user(
-    db: AsyncSession = Depends(get_db_session), token: str = Depends(oauth2_scheme)
-) -> UserModel:
-    """Decodes JWT and retrieves the current authenticated user."""
+    db: AsyncSession = Depends(get_db), token: str = Depends(reusable_oauth2)
+) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
+        payload = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+        )
+        token_data = TokenData(**payload)
+        if token_data.username is None:
             raise credentials_exception
-        token_data = TokenData(username=username)
     except (JWTError, ValidationError):
         raise credentials_exception
-        
-    user = await crud_user.get_user_by_username(db, username=token_data.username)
-    if user is None:
+    
+    user = await crud_user.get_by_username(db, username=token_data.username)
+    if not user:
         raise credentials_exception
     return user
 
-async def get_current_active_user(
-    current_user: UserModel = Depends(get_current_user)
-) -> UserModel:
-    """Ensures the retrieved user is active."""
-    if not current_user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
-    return current_user
-
-async def get_user_with_phi_access(
-    current_user: UserModel = Depends(get_current_active_user)
-) -> UserModel:
-    """
-    Ensures the user has a role permitted to access PHI,
-    as defined in the application settings.
-    """
-    if current_user.role not in settings.PHI_ACCESS_ROLES:
+def get_current_active_clinician(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    # Example authorization check: only clinicians and admins can perform certain actions
+    if current_user.role not in ["clinician", "admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="The user does not have sufficient privileges for this resource"
+            detail="The user does not have sufficient privileges.",
         )
     return current_user
 
-class AuditLogger:
-    """Dependency class to handle automatic audit logging for an endpoint."""
-    def __init__(self, action: str, resource_type: str):
-        self.action = action
-        self.resource_type = resource_type
+```
 
-    async def __call__(
-        self,
-        request: Request,
-        db: AsyncSession = Depends(get_db_session),
-        user: UserModel = Depends(get_user_with_phi_access)
-    ) -> None:
-        async def log(status: str, resource_id: Optional[str] = None, details: Optional[dict] = None):
-            log_entry = AuditLogCreate(
-                user_id=user.id,
-                action=self.action,
-                resource_type=self.resource_type,
-                resource_id=resource_id,
-                status=status,
-                ip_address=request.client.host,
-                user_agent=request.headers.get("user-agent"),
-                details=details or {}
-            )
-            await crud_audit.create_audit_log(db, log_entry)
-        
-        request.state.audit_log = log
+```python
+# /api/v1/endpoints/login.py
 
-# Include routers from endpoint modules
-api_router.include_router(auth.router, prefix="/auth")
-api_router.include_router(patients.router, prefix="/patients", tags=["Patients"])
-
-
-# --- /api/v1/endpoints/patients.py ---
-# Description: API endpoints for managing patient demographic data (PHI).
-#
-import uuid
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from datetime import timedelta
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Callable
-from api.v1.api import get_user_with_phi_access, AuditLogger
-from crud import crud_patient
-from db.session import get_db_session
-from models.user import User as UserModel
-from schemas.patient import PatientCreate, PatientInDB, PatientUpdate
+
+from core.config import settings
+from crud import crud_user
+from db.session import get_db
+from schemas.token import Token
+from security.password import password_manager
+from security.token import token_manager
 
 router = APIRouter()
 
-@router.post("/", response_model=PatientInDB, status_code=status.HTTP_201_CREATED)
-async def create_patient_record(
-    patient_in: PatientCreate,
-    request: Request,
-    db: AsyncSession = Depends(get_db_session),
-    audit_log: Callable = Depends(AuditLogger(action="PATIENT_CREATE", resource_type="Patient"))
+@router.post("/access-token", response_model=Token)
+async def login_access_token(
+    db: AsyncSession = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()
 ):
     """
-    Create a new patient record.
-    Requires authenticated user with PHI access rights.
+    OAuth2 compatible token login, get an access token for future requests.
     """
-    existing_patient = await crud_patient.get_patient_by_mrn(db, mrn=patient_in.mrn)
-    if existing_patient:
-        await audit_log(status="FAILURE", resource_id=patient_in.mrn, details={"error": "MRN already exists"})
+    user = await crud_user.get_by_username(db, username=form_data.username)
+    if not user or not password_manager.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Patient with MRN {patient_in.mrn} already exists."
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     
-    patient = await crud_patient.create_patient(db=db, patient=patient_in)
-    await audit_log(status="SUCCESS", resource_id=str(patient.id))
-    return patient
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    # Add user metadata to token subject
+    token_subject = {
+        "user_id": str(user.id),
+        "username": user.username,
+        "role": user.role
+    }
 
-@router.get("/{patient_id}", response_model=PatientInDB)
-async def get_patient_by_id(
-    patient_id: uuid.UUID,
-    request: Request,
-    db: AsyncSession = Depends(get_db_session),
-    audit_log: Callable = Depends(AuditLogger(action="PATIENT_VIEW", resource_type="Patient"))
+    access_token = token_manager.create_access_token(
+        subject=token_subject, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+```
+
+```python
+# /api/v1/endpoints/documents.py
+
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List
+
+from crud import crud_document, crud_patient, crud_audit_log
+from db.session import get_db
+from models.user import User
+from schemas.audit_log import AuditLogCreate
+from schemas.document import (
+    DocumentUploadRequest, DocumentUploadURLResponse, DocumentCreate,
+    DocumentResponse, DocumentDownloadURLResponse
+)
+from security.dependencies import get_current_user, get_current_active_clinician
+from security.s3_client import s3_client
+
+router = APIRouter()
+
+@router.post(
+    "/upload-url",
+    response_model=DocumentUploadURLResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Request secure upload URL for a clinical document"
+)
+async def request_upload_url(
+    upload_request: DocumentUploadRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_clinician)
 ):
     """
-    Retrieve a patient's demographic data by their internal ID.
-    Requires authenticated user with PHI access rights.
+    First step of document upload.
+    Generates a pre-signed S3 URL for the client to upload the file directly.
+    This prevents large file transfers through the API server.
     """
-    patient = await crud_patient.get_patient_by_id(db, patient_id=patient_id)
+    patient = await crud_patient.get(db, id=upload_request.patient_id)
     if not patient:
-        await audit_log(status="FAILURE", resource_id=str(patient_id), details={"error": "Patient not found"})
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
-    
-    await audit_log(status="SUCCESS", resource_id=str(patient.id))
-    return patient
 
-@router.put("/{patient_id}", response_model=PatientInDB)
-async def update_patient_record(
-    patient_id: uuid.UUID,
-    patient_in: PatientUpdate,
-    request: Request,
-    db: AsyncSession = Depends(get_db_session),
-    audit_log: Callable = Depends(AuditLogger(action="PATIENT_UPDATE", resource_type="Patient"))
+    s3_key = f"patients/{patient.id}/documents/{uuid.uuid4()}_{upload_request.file_name}"
+    upload_url = s3_client.generate_presigned_upload_url(s3_key, upload_request.mime_type)
+
+    if not upload_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not generate upload URL. Please try again later."
+        )
+
+    # Pre-emptive audit log for upload attempt
+    await crud_audit_log.log_event(db, obj_in=AuditLogCreate(
+        user_id=current_user.id,
+        action="REQUEST_DOCUMENT_UPLOAD_URL",
+        details={"patient_id": str(patient.id), "s3_key": s3_key}
+    ))
+
+    return {"upload_url": upload_url, "s3_key": s3_key}
+
+
+@router.post(
+    "/",
+    response_model=DocumentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Confirm document upload and create metadata record"
+)
+async def create_document_metadata(
+    *,
+    db: AsyncSession = Depends(get_db),
+    doc_in: DocumentCreate,
+    current_user: User = Depends(get_current_active_clinician)
 ):
     """
-    Update a patient's demographic information.
-    Requires authenticated user with PHI access rights.
+    Second step of document upload.
+    After the client successfully uploads the file to S3, it calls this endpoint
+    to create the document's metadata record in the database.
     """
-    db_patient = await crud_patient.get_patient_by_id(db, patient_id=patient_id)
-    if not db_patient:
-        await audit_log(status="FAILURE", resource_id=str(patient_id), details={"error": "Patient not found"})
+    patient = await crud_patient.get(db, id=doc_in.patient_id)
+    if not patient:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
+    document = await crud_document.create_with_uploader(db=db, obj_in=doc_in, uploader_id=current_user.id)
+    
+    await crud_audit_log.log_event(db, obj_in=AuditLogCreate(
+        user_id=current_user.id,
+        action="CREATE_DOCUMENT_METADATA",
+        details={"patient_id": str(patient.id), "document_id": str(document.id)}
+    ))
+
+    return document
+
+
+@router.get(
+    "/patient/{patient_id}",
+    response_model=List[DocumentResponse],
+    summary="List all clinical documents for a patient"
+)
+async def get_patient_documents(
+    patient_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    skip: int = 0,
+    limit: int = 100
+):
+    """
+    Retrieves a list of all document metadata for a specific patient.
+    Access is logged for HIPAA auditing.
+    """
+    patient = await crud_patient.get(db, id=patient_id)
+    if not patient:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
     
-    # Do not allow MRN to be updated via this endpoint
-    if patient_in.model_dump(exclude_unset=True).get("mrn"):
-         await audit_log(status="FAILURE", resource_id=str(patient_id), details={"error": "MRN update not allowed"})
-         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MRN updates are not permitted.")
+    # Authorization logic: is this user allowed to see this patient's data?
+    # This is a placeholder for a more complex access control system (e.g., care team).
+    if current_user.role not in ["admin", "clinician", "nurse"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
-    update_diff = crud_patient.get_patient_update_diff(db_patient, patient_in)
+    await crud_audit_log.log_event(db, obj_in=AuditLogCreate(
+        user_id=current_user.id,
+        action="LIST_PATIENT_DOCUMENTS",
+        details={"patient_id": str(patient.id)}
+    ))
+
+    documents = await crud_document.get_multi_by_patient(
+        db, patient_id=patient_id, skip=skip, limit=limit
+    )
+    return documents
+
+
+@router.get(
+    "/{document_id}/download-url",
+    response_model=DocumentDownloadURLResponse,
+    summary="Get secure download URL for a clinical document"
+)
+async def get_document_download_url(
+    document_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Retrieves a pre-signed S3 URL to download a document.
+    Access is strictly controlled and audited.
+    """
+    document = await crud_document.get(db, id=document_id)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     
-    if not update_diff["changes"]:
-        await audit_log(status="SUCCESS", resource_id=str(patient_id), details={"info": "No changes detected"})
-        return db_patient # Return original record if no changes
-        
-    updated_patient = await crud_patient.update_patient(db=db, db_patient=db_patient, patient_in=patient_in)
-    await audit_log(status="SUCCESS", resource_id=str(patient_id), details=update_diff)
-    return updated_patient
+    # Authorization logic (similar to listing)
+    if current_user.role not in ["admin", "clinician", "nurse"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
+    download_url = s3_client.generate_presigned_download_url(s3_key=document.s3_key)
+    if not download_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not generate download URL. Please try again later."
+        )
 
-# --- /main.py ---
-# Description: Main FastAPI application entry point.
-#
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from starlette.middleware.cors import CORSMiddleware
+    await crud_audit_log.log_event(db, obj_in=AuditLogCreate(
+        user_id=current_user.id,
+        action="ACCESS_DOCUMENT",
+        details={"patient_id": str(document.patient_id), "document_id": str(document.id)}
+    ))
+
+    return {"download_url": download_url}
+
+```
+
+```python
+# /api/v1/api.py
+
+from fastapi import APIRouter
+from api.v1.endpoints import login, documents
+
+api_router = APIRouter()
+api_router.include_router(login.router, prefix="/login", tags=["login"])
+api_router.include_router(documents.router, prefix="/documents", tags=["documents"])
+
+```
+
+```python
+# /main.py
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from api.v1.api import api_router
-from db.session import Base, async_engine
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title=settings.PROJECT_NAME,
+    title="EMR Clinical Document Service",
+    description="HIPAA-compliant service for managing clinical documents.",
+    version="1.0.0",
     openapi_url=f"{settings.API_V1_STR}/openapi.json"
 )
 
-# Exception handler to prevent leaking internal error details
-@app.exception_handler(Exception)
-async def validation_exception_handler(request: Request, exc: Exception):
-    logger.error(f"An unhandled exception occurred for request {request.method} {request.url}: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "An internal server error occurred. The incident has been logged."},
-    )
-
-# Set all CORS enabled origins
+# CORS Middleware for browser-based clients
+# In production, restrict origins to the specific frontend application domain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to known frontend domains.
+    allow_origins=["*"],  # Restrict this in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Startup event to create database tables
-@app.on_event("startup")
-async def on_startup():
-    async with async_engine.begin() as conn:
-        # The following command creates all tables defined by models
-        # that inherit from Base. Use Alembic for production migrations.
-        # await conn.run_sync(Base.metadata.drop_all) # Use for development reset
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables verified/created.")
-
-# Include the main API router
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
 @app.get("/", include_in_schema=False)
-def read_root():
-    return {"status": "EMR Backend Service is running."}
-
-# To run this application:
-# 1. Set environment variables for SECRET_KEY and DATABASE_URL.
-# 2. Install dependencies: uvicorn, fastapi, sqlalchemy[asyncpg], pydantic[email], python-jose[cryptography], passlib[bcrypt], pydantic-settings
-# 3. Run with uvicorn: `uvicorn main:app --reload`
-
-# Example of creating a user for testing (can be done via a script or the include_in_schema=False endpoint):
-# curl -X POST "http://127.0.0.1:8000/api/v1/auth/users/create" \
-# -H "Content-Type: application/json" \
-# -d '{"username": "dr.house", "password": "securepassword123", "full_name": "Gregory House", "role": "clinician"}'
+def root():
+    return {"status": "ok", "service": "EMR Clinical Document Service"}
 
 ```
