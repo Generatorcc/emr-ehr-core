@@ -1,332 +1,321 @@
 ```python
-# main.py
-# Main application entry point.
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
-from datetime import timedelta
+# --- FILENAME: core/config.py ---
 
-from api.v1.api import api_router
-from core.config import settings
-from db.session import get_db, engine
-from db import base
-from security import auth
-from schemas.user import User
-from schemas.token import Token
-from crud import base as crud_base
-
-# Create all database tables
-base.Base.metadata.create_all(bind=engine)
-
-app = FastAPI(
-    title="EMR-Core API",
-    description="Backend services for the National EMR Platform.",
-    version="1.0.0",
-    openapi_url=f"{settings.API_V1_STR}/openapi.json",
-)
-
-@app.post("/token", response_model=Token, tags=["Authentication"])
-def login_for_access_token(
-    db: Session = Depends(get_db),
-    form_data: OAuth2PasswordRequestForm = Depends()
-):
-    """
-    Standard OAuth2 password flow to obtain a JWT access token.
-    """
-    user = auth.authenticate_user(db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Inactive user"
-        )
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = auth.create_access_token(
-        data={"sub": user.username, "role": user.role},
-        expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
-
-
-app.include_router(api_router, prefix=settings.API_V1_STR)
-
-# /api/v1/api.py
-# API router aggregator.
-from fastapi import APIRouter
-from api.v1.endpoints import notes
-
-api_router = APIRouter()
-api_router.include_router(notes.router, prefix="/records", tags=["Medical Records"])
-
-
-# /api/v1/endpoints/notes.py
-# Endpoint logic for accessing patient medical notes.
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from sqlalchemy.orm import Session
-
-from db.session import get_db
-from models.medical import User as UserModel
-from schemas import note as note_schema
-from schemas import audit as audit_schema
-from crud import base as crud_base
-from security.auth import get_current_active_user, UserRole
-
-router = APIRouter()
-
-@router.get(
-    "/patients/{patient_id}/notes/{note_id}",
-    response_model=note_schema.PatientNoteResponse,
-    summary="Fetch a specific patient medical note",
-    status_code=status.HTTP_200_OK,
-    dependencies=[Depends(get_current_active_user(required_role=UserRole.CLINICIAN))]
-)
-def read_patient_note(
-    *,
-    db: Session = Depends(get_db),
-    patient_id: int,
-    note_id: int,
-    request: Request,
-    current_user: UserModel = Depends(get_current_active_user(required_role=UserRole.CLINICIAN)),
-):
-    """
-    Retrieves a specific medical note for a given patient.
-
-    Access is restricted to authenticated users with the 'clinician' role.
-    All access events are logged for HIPAA auditing purposes.
-    """
-    db_note = crud_base.get_patient_note(db=db, note_id=note_id, patient_id=patient_id)
-
-    if not db_note:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Patient note not found."
-        )
-
-    # HIPAA Audit Logging: Record every access to PHI.
-    audit_log_entry = audit_schema.AuditLogCreate(
-        user_id=current_user.id,
-        patient_id=patient_id,
-        action="VIEW_PATIENT_NOTE",
-        ip_address=request.client.host if request.client else "unknown",
-        details=f"Clinician '{current_user.username}' viewed note_id '{note_id}' for patient_id '{patient_id}'.",
-    )
-    crud_base.create_audit_log(db=db, log_entry=audit_log_entry)
-
-    # In a real system, content would be decrypted here.
-    # For this example, we assume `content_encrypted_ref` is a handle
-    # to an encrypted object store (e.g., S3 with SSE-KMS).
-    # The decrypted content would populate the response model.
-    decrypted_content = f"[DECRYPTED CONTENT FOR REF: {db_note.content_encrypted_ref}]"
-
-    return note_schema.PatientNoteResponse(
-        id=db_note.id,
-        patient_id=db_note.patient_id,
-        author_id=db_note.author_id,
-        note_type=db_note.note_type,
-        content=decrypted_content,
-        created_at=db_note.created_at,
-        updated_at=db_note.updated_at
-    )
-
-
-# /core/config.py
-# Application configuration settings.
 import os
-from pydantic_settings import BaseSettings
+from pydantic import BaseSettings, AnyHttpUrl, Field
+from typing import List, Union
 
 class Settings(BaseSettings):
+    """
+    Application-wide settings loaded from environment variables.
+    """
+    PROJECT_NAME: str = "EMR Patient Document Service"
     API_V1_STR: str = "/api/v1"
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "a_very_secret_key_for_development_only")
+    
+    # Security settings
+    SECRET_KEY: str = Field(..., env="SECRET_KEY")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/emrdb")
+    
+    # Database settings
+    POSTGRES_SERVER: str = Field(..., env="POSTGRES_SERVER")
+    POSTGRES_USER: str = Field(..., env="POSTGRES_USER")
+    POSTGRES_PASSWORD: str = Field(..., env="POSTGRES_PASSWORD")
+    POSTGRES_DB: str = Field(..., env="POSTGRES_DB")
+    SQLALCHEMY_DATABASE_URI: str = None
+
+    def __init__(self, **values):
+        super().__init__(**values)
+        self.SQLALCHEMY_DATABASE_URI = (
+            f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
+            f"{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
+        )
+
+    # S3 Storage settings for PHI
+    S3_BUCKET_NAME: str = Field(..., env="S3_BUCKET_NAME")
+    S3_AWS_REGION: str = Field(..., env="S3_AWS_REGION")
+    S3_ACCESS_KEY_ID: str = Field(..., env="S3_ACCESS_KEY_ID")
+    S3_SECRET_ACCESS_KEY: str = Field(..., env="S3_SECRET_ACCESS_KEY")
+    S3_PRESIGNED_URL_EXPIRATION: int = 300 # seconds
+
+    # CORS settings
+    BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = []
 
     class Config:
         case_sensitive = True
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
 settings = Settings()
 
+# --- FILENAME: db/session.py ---
 
-# /db/session.py
-# Database session management.
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from core.config import settings
+from typing import Generator
 
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(settings.SQLALCHEMY_DATABASE_URI, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def get_db():
-    db = SessionLocal()
+def get_db() -> Generator:
+    """
+    Dependency to get a DB session for a request.
+    Ensures the session is closed after the request is finished.
+    """
     try:
+        db = SessionLocal()
         yield db
     finally:
         db.close()
 
+# --- FILENAME: db/base_class.py ---
 
-# /db/base.py
-# Base model for SQLAlchemy ORM.
-from sqlalchemy.orm import declarative_base
-Base = declarative_base()
+from sqlalchemy.ext.declarative import as_declarative, declared_attr
 
+@as_declarative()
+class Base:
+    """Base for all SQLAlchemy models."""
+    id: int
+    __name__: str
 
-# /models/medical.py
-# SQLAlchemy ORM models for the EMR system.
-from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Enum as SQLAlchemyEnum
-)
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-import enum
+    # Generate __tablename__ automatically
+    @declared_attr
+    def __tablename__(cls) -> str:
+        return cls.__name__.lower() + "s"
 
-from db.base import Base
+# --- FILENAME: models/user.py ---
 
-class UserRole(str, enum.Enum):
-    ADMIN = "admin"
-    CLINICIAN = "clinician"
-    PATIENT = "patient"
+import uuid
+from sqlalchemy import Column, String, Boolean
+from sqlalchemy.dialects.postgresql import UUID
+from db.base_class import Base
 
 class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
+    """Represents a system user (e.g., clinician, admin)."""
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    full_name = Column(String(255), index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    role = Column(SQLAlchemyEnum(UserRole), nullable=False)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    audit_logs = relationship("AuditLog", back_populates="user")
+    is_active = Column(Boolean(), default=True)
+    # Role-based access control would be defined here in a real system.
+    # For simplicity, all authenticated users have access in this example.
 
-class Patient(Base):
-    __tablename__ = "patients"
-    id = Column(Integer, primary_key=True, index=True)
-    first_name_encrypted = Column(String, nullable=False) # Encrypted at application level
-    last_name_encrypted = Column(String, nullable=False)  # Encrypted at application level
-    dob_encrypted = Column(String, nullable=False)       # Encrypted at application level
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    notes = relationship("PatientNote", back_populates="patient")
-    audit_logs = relationship("AuditLog", back_populates="patient")
+# --- FILENAME: models/document.py ---
 
-class PatientNote(Base):
-    __tablename__ = "patient_notes"
-    id = Column(Integer, primary_key=True, index=True)
-    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False)
-    author_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    note_type = Column(String, nullable=False, default="Progress Note")
-    content_encrypted_ref = Column(Text, nullable=False) # Reference to content in secure storage
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    patient = relationship("Patient", back_populates="notes")
-    author = relationship("User")
+import uuid
+from sqlalchemy import Column, String, DateTime, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.sql import func
+from db.base_class import Base
+
+class Document(Base):
+    """Stores metadata for a patient document stored in S3."""
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    patient_id = Column(UUID(as_uuid=True), index=True, nullable=False)
+    document_name = Column(String, nullable=False)
+    document_type = Column(String, index=True, nullable=False)
+    s3_object_key = Column(String, unique=True, nullable=False)
+    uploaded_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
+    content_type = Column(String, nullable=False)
+    file_size_bytes = Column(String, nullable=False)
+
+# --- FILENAME: models/audit_log.py ---
+
+import uuid
+from sqlalchemy import Column, String, DateTime, JSON
+from sqlalchemy.dialects.postgresql import UUID, INET
+from sqlalchemy.sql import func
+from db.base_class import Base
 
 class AuditLog(Base):
-    __tablename__ = "audit_logs"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=True) # Can be null for system-level actions
-    action = Column(String, nullable=False) # e.g., 'LOGIN', 'VIEW_PATIENT_CHART', 'CREATE_NOTE'
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    ip_address = Column(String, nullable=False)
-    details = Column(Text, nullable=True) # Context about the action
-    user = relationship("User", back_populates="audit_logs")
-    patient = relationship("Patient", back_populates="audit_logs")
+    """HIPAA-compliant audit log for tracking PHI access."""
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    event_type = Column(String, index=True, nullable=False) # e.g., 'DOCUMENT_UPLOAD', 'DOCUMENT_VIEW'
+    source_ip = Column(INET, nullable=True)
+    details = Column(JSON, nullable=True) # Contains patient_id, document_id, etc.
 
+# --- FILENAME: schemas/token.py ---
 
-# /schemas/note.py
-# Pydantic models for patient notes.
-from pydantic import BaseModel
-from datetime import datetime
-
-class PatientNoteBase(BaseModel):
-    note_type: str
-    content: str
-
-class PatientNoteCreate(PatientNoteBase):
-    patient_id: int
-    author_id: int
-
-class PatientNoteResponse(BaseModel):
-    id: int
-    patient_id: int
-    author_id: int
-    note_type: str
-    content: str
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-# /schemas/audit.py
-# Pydantic models for audit logs.
 from pydantic import BaseModel
 from typing import Optional
-
-class AuditLogCreate(BaseModel):
-    user_id: int
-    action: str
-    ip_address: str
-    patient_id: Optional[int] = None
-    details: Optional[str] = None
-
-
-# /schemas/user.py
-# Pydantic models for users.
-from pydantic import BaseModel
-from models.medical import UserRole
-
-class UserBase(BaseModel):
-    username: str
-
-class UserCreate(UserBase):
-    password: str
-    role: UserRole
-
-class User(UserBase):
-    id: int
-    is_active: bool
-    role: UserRole
-
-    class Config:
-        from_attributes = True
-
-# /schemas/token.py
-# Pydantic models for authentication tokens.
-from pydantic import BaseModel
-from typing import Optional
+import uuid
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
 class TokenData(BaseModel):
-    username: Optional[str] = None
-    role: Optional[str] = None
+    user_id: Optional[uuid.UUID] = None
 
+# --- FILENAME: schemas/user.py ---
 
-# /security/auth.py
-# Authentication, authorization, and password management.
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Callable
-from jose import JWTError, jwt
+from pydantic import BaseModel, EmailStr
+import uuid
+
+class UserBase(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = None
+    is_active: Optional[bool] = True
+
+class UserCreate(UserBase):
+    password: str
+
+class UserInDB(UserBase):
+    id: uuid.UUID
+
+    class Config:
+        orm_mode = True
+
+class User(UserInDB):
+    pass
+
+# --- FILENAME: schemas/document.py ---
+
+from pydantic import BaseModel
+from typing import Optional
+import uuid
+from datetime import datetime
+
+class DocumentBase(BaseModel):
+    patient_id: uuid.UUID
+    document_type: str
+    document_name: str
+
+class DocumentCreate(DocumentBase):
+    pass
+
+class DocumentMetadata(DocumentBase):
+    id: uuid.UUID
+    uploaded_by_user_id: uuid.UUID
+    uploaded_at: datetime
+    content_type: str
+    file_size_bytes: int
+
+    class Config:
+        orm_mode = True
+
+class DocumentDownload(BaseModel):
+    presigned_url: str
+    expires_at: datetime
+
+# --- FILENAME: schemas/audit_log.py ---
+
+from pydantic import BaseModel
+from typing import Any, Optional
+import uuid
+from datetime import datetime
+
+class AuditLogCreate(BaseModel):
+    user_id: uuid.UUID
+    event_type: str
+    source_ip: Optional[str] = None
+    details: Optional[dict[str, Any]] = None
+
+# --- FILENAME: crud/base.py ---
+
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from db.base_class import Base
+
+ModelType = TypeVar("ModelType", bound=Base)
+CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
+
+class CRUDBase(Generic[ModelType, CreateSchemaType]):
+    def __init__(self, model: Type[ModelType]):
+        self.model = model
+
+    def create(self, db: Session, *, obj_in: CreateSchemaType) -> ModelType:
+        obj_in_data = obj_in.dict()
+        db_obj = self.model(**obj_in_data)
+        db.add(db_obj)
+        db.commit()
+        db.refresh(db_obj)
+        return db_obj
+
+# --- FILENAME: crud/crud_audit.py ---
+
+from crud.base import CRUDBase
+from models.audit_log import AuditLog
+from schemas.audit_log import AuditLogCreate
+
+class CRUDAuditLog(CRUDBase[AuditLog, AuditLogCreate]):
+    pass
+
+crud_audit = CRUDAuditLog(AuditLog)
+
+# --- FILENAME: crud/crud_document.py ---
+
+from typing import List, Optional
+import uuid
+from sqlalchemy.orm import Session
+from crud.base import CRUDBase
+from models.document import Document
+from schemas.document import DocumentCreate
+
+class CRUDDocument(CRUDBase[Document, DocumentCreate]):
+    def get(self, db: Session, id: uuid.UUID) -> Optional[Document]:
+        return db.query(self.model).filter(self.model.id == id).first()
+
+    def get_multi_by_patient(self, db: Session, *, patient_id: uuid.UUID, skip: int = 0, limit: int = 100) -> List[Document]:
+        return db.query(self.model).filter(self.model.patient_id == patient_id).offset(skip).limit(limit).all()
+
+crud_document = CRUDDocument(Document)
+
+# --- FILENAME: crud/crud_user.py ---
+
+from typing import Optional
+import uuid
+from sqlalchemy.orm import Session
+from crud.base import CRUDBase
+from models.user import User
+from schemas.user import UserCreate
+from core.security import get_password_hash
+
+class CRUDUser(CRUDBase[User, UserCreate]):
+    def get_by_email(self, db: Session, *, email: str) -> Optional[User]:
+        return db.query(User).filter(User.email == email).first()
+
+    def get(self, db: Session, id: uuid.UUID) -> Optional[User]:
+        return db.query(self.model).filter(self.model.id == id).first()
+
+    def create(self, db: Session, *, obj_in: UserCreate) -> User:
+        db_obj = User(
+            email=obj_in.email,
+            hashed_password=get_password_hash(obj_in.password),
+            full_name=obj_in.full_name,
+            is_active=obj_in.is_active
+        )
+        db.add(db_obj)
+        db.commit()
+        db.refresh(db_obj)
+        return db_obj
+
+crud_user = CRUDUser(User)
+
+# --- FILENAME: core/security.py ---
+
+from datetime import datetime, timedelta
+from typing import Any, Union, Optional
+from jose import jwt, JWTError
 from passlib.context import CryptContext
+from pydantic import ValidationError
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from core.config import settings
 from db.session import get_db
-from models.medical import User, UserRole
-from crud import base as crud_base
 from schemas.token import TokenData
+from models.user import User
+from crud.crud_user import crud_user
+import uuid
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/users/token")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -334,23 +323,15 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
+def create_access_token(subject: Union[str, Any], expires_delta: Optional[timedelta] = None) -> str:
     if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
+        expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
+        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode = {"exp": expire, "sub": str(subject)}
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
-
-def authenticate_user(db: Session, username: str, password: str) -> Optional[User]:
-    user = crud_base.get_user_by_username(db, username=username)
-    if not user:
-        return None
-    if not verify_password(password, user.hashed_password):
-        return None
-    return user
 
 def get_current_user(
     db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)
@@ -362,52 +343,349 @@ def get_current_user(
     )
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username, role=payload.get("role"))
-    except JWTError:
+        token_data = TokenData(user_id=payload.get("sub"))
+    except (JWTError, ValidationError):
         raise credentials_exception
-    user = crud_base.get_user_by_username(db, username=token_data.username)
+    
+    if token_data.user_id is None:
+        raise credentials_exception
+        
+    user_id_as_uuid = uuid.UUID(token_data.user_id)
+    user = crud_user.get(db, id=user_id_as_uuid)
     if user is None:
         raise credentials_exception
     return user
 
-def get_current_active_user(required_role: UserRole) -> Callable[[User], User]:
-    def role_checker(current_user: User = Depends(get_current_user)) -> User:
-        if not current_user.is_active:
-            raise HTTPException(status_code=400, detail="Inactive user")
-        if current_user.role != required_role and current_user.role != UserRole.ADMIN:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Operation not permitted. Requires '{required_role.value}' role."
-            )
-        return current_user
-    return role_checker
+def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
+    if not current_user.is_active:
+        raise HTTPException(status_code=403, detail="Inactive user")
+    return current_user
 
+# --- FILENAME: services/audit_service.py ---
 
-# /crud/base.py
-# Core CRUD operations for database models.
 from sqlalchemy.orm import Session
-from typing import Optional
+from fastapi import Request
+from crud.crud_audit import crud_audit
+from schemas.audit_log import AuditLogCreate
+import uuid
+from typing import Any
 
-from models import medical as models
-from schemas import audit as audit_schema
-from security import auth
+class AuditService:
+    @staticmethod
+    def log_event(
+        db: Session,
+        user_id: uuid.UUID,
+        event_type: str,
+        request: Request,
+        details: dict[str, Any]
+    ):
+        """Creates a detailed audit log entry."""
+        log_entry = AuditLogCreate(
+            user_id=user_id,
+            event_type=event_type,
+            source_ip=request.client.host if request.client else None,
+            details=details
+        )
+        crud_audit.create(db, obj_in=log_entry)
 
-def get_user_by_username(db: Session, username: str) -> Optional[models.User]:
-    return db.query(models.User).filter(models.User.username == username).first()
+audit_service = AuditService()
 
-def get_patient_note(db: Session, note_id: int, patient_id: int) -> Optional[models.PatientNote]:
-    return db.query(models.PatientNote).filter(
-        models.PatientNote.id == note_id,
-        models.PatientNote.patient_id == patient_id
-    ).first()
+# --- FILENAME: services/s3_service.py ---
 
-def create_audit_log(db: Session, log_entry: audit_schema.AuditLogCreate) -> models.AuditLog:
-    db_log = models.AuditLog(**log_entry.model_dump())
-    db.add(db_log)
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
+from fastapi import UploadFile, HTTPException, status
+from core.config import settings
+import uuid
+
+class S3Service:
+    def __init__(self):
+        self.s3_client = boto3.client(
+            's3',
+            aws_access_key_id=settings.S3_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.S3_SECRET_ACCESS_KEY,
+            region_name=settings.S3_AWS_REGION,
+            config=Config(signature_version='s3v4')
+        )
+        self.bucket_name = settings.S3_BUCKET_NAME
+
+    def upload_file(self, file: UploadFile, patient_id: uuid.UUID, uploader_id: uuid.UUID) -> str:
+        """Uploads a file to S3 with server-side encryption and returns the object key."""
+        object_key = f"patients/{patient_id}/documents/{uuid.uuid4()}-{file.filename}"
+        
+        try:
+            self.s3_client.upload_fileobj(
+                file.file,
+                self.bucket_name,
+                object_key,
+                ExtraArgs={
+                    'ServerSideEncryption': 'AES256',
+                    'Metadata': {
+                        'patient_id': str(patient_id),
+                        'uploader_id': str(uploader_id)
+                    }
+                }
+            )
+        except ClientError as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to upload document to storage: {e}"
+            )
+        return object_key
+
+    def generate_presigned_url(self, object_key: str) -> str:
+        """Generates a pre-signed URL to securely download a file."""
+        try:
+            url = self.s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.bucket_name, 'Key': object_key},
+                ExpiresIn=settings.S3_PRESIGNED_URL_EXPIRATION
+            )
+        except ClientError as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to generate secure download link: {e}"
+            )
+        return url
+
+s3_service = S3Service()
+
+# --- FILENAME: api/v1/endpoints/users.py ---
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from datetime import timedelta
+
+from schemas.token import Token
+from schemas.user import User, UserCreate
+from crud import crud_user
+from core.security import create_access_token, verify_password
+from core.config import settings
+from db.session import get_db
+
+router = APIRouter()
+
+@router.post("/token", response_model=Token)
+def login_for_access_token(
+    db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()
+):
+    """
+    OAuth2 compatible token login, get an access token for future requests.
+    """
+    user = crud_user.get_by_email(db, email=form_data.username)
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        subject=user.id, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/register", response_model=User, status_code=status.HTTP_201_CREATED)
+def create_user(
+    *,
+    db: Session = Depends(get_db),
+    user_in: UserCreate
+):
+    """
+    Create new user. In a real system, this would be a protected endpoint
+    for administrators only.
+    """
+    user = crud_user.get_by_email(db, email=user_in.email)
+    if user:
+        raise HTTPException(
+            status_code=400,
+            detail="The user with this email already exists in the system.",
+        )
+    user = crud_user.create(db, obj_in=user_in)
+    return user
+
+# --- FILENAME: api/v1/endpoints/documents.py ---
+
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Request, status
+from sqlalchemy.orm import Session
+from typing import List
+import uuid
+from datetime import datetime, timedelta
+
+from db.session import get_db
+from models.user import User as UserModel
+from schemas.document import DocumentCreate, DocumentMetadata, DocumentDownload
+from core.security import get_current_active_user
+from crud.crud_document import crud_document
+from services.s3_service import s3_service
+from services.audit_service import audit_service
+from core.config import settings
+
+router = APIRouter()
+
+@router.post("/patients/{patient_id}/documents", response_model=DocumentMetadata, status_code=status.HTTP_201_CREATED)
+def upload_document(
+    *,
+    patient_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_active_user),
+    request: Request,
+    document_type: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """
+    Uploads a document for a specific patient. The file is stored in an encrypted
+    S3 bucket, while metadata is stored in the database. An audit log is created.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file name provided.")
+
+    # In a real system, verify user has rights to this patient_id
+    # e.g., check patient-provider relationship table.
+
+    s3_object_key = s3_service.upload_file(file, patient_id, current_user.id)
+    
+    file.file.seek(0, os.SEEK_END)
+    file_size = file.file.tell()
+    
+    doc_in = DocumentCreate(
+        patient_id=patient_id,
+        document_type=document_type,
+        document_name=file.filename
+    )
+    
+    db_obj = crud_document.model(
+        **doc_in.dict(),
+        uploaded_by_user_id=current_user.id,
+        s3_object_key=s3_object_key,
+        content_type=file.content_type,
+        file_size_bytes=file_size
+    )
+    
+    db.add(db_obj)
     db.commit()
-    db.refresh(db_log)
-    return db_log
+    db.refresh(db_obj)
+    
+    audit_service.log_event(
+        db=db,
+        user_id=current_user.id,
+        event_type="DOCUMENT_UPLOAD",
+        request=request,
+        details={"patient_id": str(patient_id), "document_id": str(db_obj.id)}
+    )
+    
+    return db_obj
+
+@router.get("/patients/{patient_id}/documents", response_model=List[DocumentMetadata])
+def list_patient_documents(
+    *,
+    patient_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_active_user),
+    request: Request
+):
+    """
+    Retrieves metadata for all documents associated with a patient.
+    This does not return the document content itself. An audit log is created.
+    """
+    # In a real system, verify user has rights to this patient_id
+    
+    documents = crud_document.get_multi_by_patient(db=db, patient_id=patient_id)
+    
+    audit_service.log_event(
+        db=db,
+        user_id=current_user.id,
+        event_type="DOCUMENT_LIST_VIEW",
+        request=request,
+        details={"patient_id": str(patient_id)}
+    )
+    
+    return documents
+
+@router.get("/documents/{document_id}/download", response_model=DocumentDownload)
+def get_document_download_url(
+    *,
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_active_user),
+    request: Request
+):
+    """
+    Generates a secure, time-limited pre-signed URL to download a document
+    directly from S3. This is the preferred method for PHI file access.
+    An audit log is created for this specific access event.
+    """
+    document = crud_document.get(db=db, id=document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # In a real system, verify user has rights to this patient
+    # e.g., check patient-provider relationship for document.patient_id
+
+    presigned_url = s3_service.generate_presigned_url(document.s3_object_key)
+    
+    audit_service.log_event(
+        db=db,
+        user_id=current_user.id,
+        event_type="DOCUMENT_DOWNLOAD",
+        request=request,
+        details={
+            "patient_id": str(document.patient_id),
+            "document_id": str(document.id)
+        }
+    )
+
+    expires_at = datetime.utcnow() + timedelta(seconds=settings.S3_PRESIGNED_URL_EXPIRATION)
+    return {"presigned_url": presigned_url, "expires_at": expires_at}
+
+
+# --- FILENAME: api/v1/api.py ---
+
+from fastapi import APIRouter
+from api.v1.endpoints import documents, users
+
+api_router = APIRouter()
+api_router.include_router(users.router, prefix="/users", tags=["users"])
+api_router.include_router(documents.router, prefix="", tags=["documents"])
+
+# --- FILENAME: main.py ---
+
+from fastapi import FastAPI
+from starlette.middleware.cors import CORSMiddleware
+from core.config import settings
+from api.v1.api import api_router
+from db.base_class import Base
+from db.session import engine
+
+# Create all database tables on startup
+# In a production environment, this should be handled by Alembic migrations
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+)
+
+# Set all CORS enabled origins
+if settings.BACKEND_CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+app.include_router(api_router, prefix=settings.API_V1_STR)
+
+@app.get("/health", status_code=status.HTTP_200_OK, tags=["health"])
+def health_check():
+    """System health check endpoint."""
+    return {"status": "ok"}
 ```
