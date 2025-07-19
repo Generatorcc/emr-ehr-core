@@ -1,460 +1,758 @@
 ```python
-# /config.py
-# Description: Manages environment-specific application settings.
+# /core/config.py
 
 import os
-from pydantic_settings import BaseSettings
+from pydantic import BaseSettings, PostgresDsn, AnyHttpUrl
+from typing import List
 
 class Settings(BaseSettings):
     """
-    Application settings loaded from environment variables.
+    Application settings, loaded from environment variables.
     """
-    # Security
-    SECRET_KEY: str = os.environ.get("SECRET_KEY", "a_very_secret_key_for_development_only")
+    PROJECT_NAME: str = "SecureEMR"
+    API_V1_STR: str = "/api/v1"
+
+    # Security settings
+    SECRET_KEY: str = os.environ.get("SECRET_KEY", "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7")
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    # A list of origins that should be permitted to make cross-origin requests.
+    # e.g. ["http://localhost:3000", "https://emr.yourdomain.com"]
+    BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = []
 
-    # Database
-    # Example: postgresql+asyncpg://user:password@host:port/dbname
-    DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql+asyncpg://emr_user:emr_pass@localhost/emr_db")
+    # Database settings
+    POSTGRES_SERVER: str = os.environ.get("POSTGRES_SERVER", "localhost")
+    POSTGRES_USER: str = os.environ.get("POSTGRES_USER", "postgres")
+    POSTGRES_PASSWORD: str = os.environ.get("POSTGRES_PASSWORD", "postgres")
+    POSTGRES_DB: str = os.environ.get("POSTGRES_DB", "emr_db")
+    SQLALCHEMY_DATABASE_URI: PostgresDsn = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_SERVER}/{POSTGRES_DB}"
 
     class Config:
         case_sensitive = True
+        env_file = ".env"
 
 settings = Settings()
+```
 
-# /database.py
-# Description: Handles database connections and session management.
+```python
+# /db/session.py
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base
-from config import settings
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from typing import Generator
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    future=True,
-    echo=False,  # Set to True for debugging SQL statements
+from core.config import settings
+
+engine = create_engine(
+    settings.SQLALCHEMY_DATABASE_URI,
     pool_pre_ping=True,
-    pool_recycle=3600
+    pool_size=10,
+    max_overflow=20
 )
 
-AsyncSessionFactory = sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autoflush=False
-)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-Base = declarative_base()
-
-# Dependency to get a database session
-async def get_db_session() -> AsyncSession:
+def get_db() -> Generator:
     """
-    Yields a new database session for a single request.
+    Provides a database session to a dependency.
     """
-    async with AsyncSessionFactory() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+    try:
+        db = SessionLocal()
+        yield db
+    finally:
+        db.close()
+```
 
+```python
+# /db/base_class.py
 
-# /models.py
-# Description: Defines SQLAlchemy ORM models for database tables.
+from typing import Any
+from sqlalchemy.ext.declarative import as_declarative, declared_attr
 
-import uuid
-from sqlalchemy import (
-    Column, String, Integer, DateTime, Boolean, ForeignKey, JSON, Enum as SQLAlchemyEnum
-)
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.sql import func
-from database import Base
+@as_declarative()
+class Base:
+    """
+    Base class for all SQLAlchemy models.
+    """
+    id: Any
+    __name__: str
+
+    # Generate __tablename__ automatically
+    @declared_attr
+    def __tablename__(cls) -> str:
+        return cls.__name__.lower() + "s"
+```
+
+```python
+# /db/models/user.py
+
+from sqlalchemy import Boolean, Column, String, Integer, Enum
+from sqlalchemy.orm import relationship
 import enum
 
-class AuditLogAction(str, enum.Enum):
-    ACCESS_PHI = "ACCESS_PHI"
-    CREATE = "CREATE"
-    UPDATE = "UPDATE"
-    DELETE = "DELETE"
-    LOGIN_SUCCESS = "LOGIN_SUCCESS"
-    LOGIN_FAIL = "LOGIN_FAIL"
+from db.base_class import Base
 
-class AuditLogOutcome(str, enum.Enum):
-    SUCCESS = "SUCCESS"
-    FAILURE = "FAILURE"
-
-class AuditLog(Base):
-    __tablename__ = 'audit_log'
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
-    user_ip_address = Column(String(45), nullable=False)
-    action = Column(SQLAlchemyEnum(AuditLogAction), nullable=False)
-    outcome = Column(SQLAlchemyEnum(AuditLogOutcome), nullable=False)
-    target_resource_type = Column(String(100), nullable=True)
-    target_resource_id = Column(String(255), nullable=True, index=True)
-    details = Column(JSON, nullable=True) # Contains contextual information, e.g., patient_id accessed
+class UserRole(str, enum.Enum):
+    ADMIN = "admin"
+    CLINICIAN = "clinician"
+    NURSE = "nurse"
+    PATIENT = "patient"
+    SYSTEM = "system"
 
 class User(Base):
-    __tablename__ = 'users'
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    username = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    full_name = Column(String, nullable=False)
-    role = Column(String, nullable=False) # e.g., 'physician', 'nurse', 'admin'
-    is_active = Column(Boolean, default=True, nullable=False)
+    id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String(255), index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    role = Column(Enum(UserRole), nullable=False, default=UserRole.CLINICIAN)
+    is_active = Column(Boolean(), default=True)
+
+    authored_notes = relationship("ClinicalNote", back_populates="author")
+    audit_logs = relationship("AuditLog", back_populates="user")
+```
+
+```python
+# /db/models/patient.py
+
+import uuid
+from sqlalchemy import Column, String, Date, Integer
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+
+from db.base_class import Base
 
 class Patient(Base):
-    __tablename__ = 'patients'
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    # De-identified fields for general reference. PHI is encrypted or managed separately.
-    mrn_hash = Column(String(256), unique=True, index=True, nullable=False) # Hash of Medical Record Number
-    date_of_birth = Column(DateTime, nullable=False)
+    id = Column(Integer, primary_key=True, index=True)
+    # Using a public-facing UUID for API endpoints to obscure integer primary keys
+    patient_uid = Column(UUID(as_uuid=True), unique=True, index=True, default=uuid.uuid4)
+    first_name = Column(String(255), nullable=False)
+    last_name = Column(String(255), nullable=False)
+    date_of_birth = Column(Date, nullable=False)
+    
+    notes = relationship("ClinicalNote", back_populates="patient", cascade="all, delete-orphan")
+    audit_logs = relationship("AuditLog", back_populates="patient")
+```
 
-class LabPanel(Base):
-    __tablename__ = 'lab_panels'
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    patient_id = Column(UUID(as_uuid=True), ForeignKey('patients.id'), nullable=False, index=True)
-    panel_name = Column(String, nullable=False) # e.g., "Complete Blood Count"
-    collection_datetime = Column(DateTime(timezone=True), nullable=False)
-    reporting_physician_id = Column(UUID(as_uuid=True), ForeignKey('users.id'), nullable=False)
-
-class LabResult(Base):
-    __tablename__ = 'lab_results'
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    lab_panel_id = Column(UUID(as_uuid=True), ForeignKey('lab_panels.id'), nullable=False, index=True)
-    test_name = Column(String, nullable=False) # e.g., "Hemoglobin"
-    value = Column(String, nullable=False) # String to accommodate various result types
-    units = Column(String, nullable=True)
-    reference_range = Column(String, nullable=True)
-    is_abnormal = Column(Boolean, default=False, nullable=False)
-
-# /schemas.py
-# Description: Pydantic models for data validation and serialization.
+```python
+# /db/models/clinical_note.py
 
 import uuid
-from pydantic import BaseModel, Field
-from datetime import datetime
-from typing import List, Optional
+from sqlalchemy import Column, ForeignKey, String, DateTime, func, Text, Boolean
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import ENCRYPT_P, DECRYPT_P
 
-# --- User & Auth Schemas ---
+from db.base_class import Base
+from core.config import settings
+
+class ClinicalNote(Base):
+    id = Column(Integer, primary_key=True, index=True)
+    note_uid = Column(UUID(as_uuid=True), unique=True, index=True, default=uuid.uuid4)
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    author_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Encrypted content field for PHI
+    _content = Column("content", String, nullable=False)
+
+    @property
+    def content(self):
+        """ Decrypts content when accessed. """
+        # This is a placeholder for a robust Key Management System (KMS).
+        # In production, use a service like AWS KMS or HashiCorp Vault.
+        # The key should never be hardcoded.
+        session = self.__dict__.get('_sa_instance_state').session
+        decrypted_content = session.query(DECRYPT_P(self._content, settings.SECRET_KEY)).scalar()
+        return decrypted_content
+
+    @content.setter
+    def content(self, value: str):
+        """ Encrypts content when set. """
+        session = self.__dict__.get('_sa_instance_state').session
+        self._content = session.query(ENCRYPT_P(value, settings.SECRET_KEY)).scalar()
+    
+    is_deleted = Column(Boolean(), default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    patient = relationship("Patient", back_populates="notes")
+    author = relationship("User", back_populates="authored_notes")
+
+```
+
+```python
+# /db/models/audit_log.py
+
+from sqlalchemy import Column, Integer, String, DateTime, func, Boolean, ForeignKey
+from sqlalchemy.orm import relationship
+
+from db.base_class import Base
+
+class AuditLog(Base):
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=True) # May not always be patient-specific
+    action = Column(String(255), nullable=False)
+    ip_address = Column(String(45)) # Supports IPv6
+    success = Column(Boolean, nullable=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    details = Column(String(1024), nullable=True)
+
+    user = relationship("User", back_populates="audit_logs")
+    patient = relationship("Patient", back_populates="audit_logs")
+
+```
+
+```python
+# /schemas/token.py
+
+from pydantic import BaseModel
+from typing import Optional
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 class TokenData(BaseModel):
-    user_id: uuid.UUID
+    user_id: Optional[int] = None
+```
 
-class User(BaseModel):
-    id: uuid.UUID
-    username: str
-    full_name: str
-    role: str
-    is_active: bool
+```python
+# /schemas/user.py
 
-    class Config:
-        from_attributes = True
+from pydantic import BaseModel, EmailStr
+from typing import Optional
+from db.models.user import UserRole
 
-# --- Lab Result Schemas ---
+class UserBase(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = None
+    is_active: Optional[bool] = True
+    role: UserRole
 
-class LabResultResponse(BaseModel):
-    id: uuid.UUID
-    test_name: str
-    value: str
-    units: Optional[str] = None
-    reference_range: Optional[str] = None
-    is_abnormal: bool
+class UserCreate(UserBase):
+    password: str
 
-    class Config:
-        from_attributes = True
+class UserUpdate(UserBase):
+    password: Optional[str] = None
 
-class LabPanelResponse(BaseModel):
-    id: uuid.UUID
-    patient_id: uuid.UUID
-    panel_name: str
-    collection_datetime: datetime
-    reporting_physician_id: uuid.UUID
-    results: List[LabResultResponse]
+class UserInDBBase(UserBase):
+    id: int
 
     class Config:
-        from_attributes = True
+        orm_mode = True
 
-# --- Audit Log Schemas ---
+class User(UserInDBBase):
+    pass
 
-class AuditLogIn(BaseModel):
-    user_id: uuid.UUID
-    user_ip_address: str
+class UserInDB(UserInDBBase):
+    hashed_password: str
+```
+
+```python
+# /schemas/audit_log.py
+
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+class AuditLogCreate(BaseModel):
+    user_id: int
     action: str
-    outcome: str
-    target_resource_type: Optional[str] = None
-    target_resource_id: Optional[str] = None
-    details: Optional[dict] = None
+    success: bool
+    ip_address: str
+    patient_id: Optional[int] = None
+    details: Optional[str] = None
 
-# /security.py
-# Description: Handles authentication, authorization, and password management.
+class AuditLogInDB(AuditLogCreate):
+    id: int
+    timestamp: datetime
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from pydantic import ValidationError
+    class Config:
+        orm_mode = True
+```
+
+```python
+# /schemas/clinical_note.py
+
 import uuid
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
 
-from config import settings
-from database import get_db_session
-from models import User as UserModel
-from schemas import TokenData, User as UserSchema
+from .user import User
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+class ClinicalNoteBase(BaseModel):
+    content: str
 
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: AsyncSession = Depends(get_db_session)
-) -> UserSchema:
-    """
-    Decodes JWT token, validates user, and returns user data.
-    """
+class ClinicalNoteCreate(ClinicalNoteBase):
+    pass
+
+class ClinicalNoteUpdate(BaseModel):
+    content: Optional[str] = None
+
+class ClinicalNoteInDBBase(ClinicalNoteBase):
+    note_uid: uuid.UUID
+    patient_id: int
+    author_id: int
+    created_at: datetime
+    updated_at: Optional[datetime]
+    author: User
+
+    class Config:
+        orm_mode = True
+
+class ClinicalNote(ClinicalNoteInDBBase):
+    pass
+```
+
+```python
+# /core/security.py
+
+from datetime import datetime, timedelta
+from typing import Optional
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+
+from core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+ALGORITHM = settings.ALGORITHM
+SECRET_KEY = settings.SECRET_KEY
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+```
+
+```python
+# /db/crud/crud_user.py
+
+from sqlalchemy.orm import Session
+from typing import Optional
+
+from core.security import get_password_hash
+from db.models.user import User
+from schemas.user import UserCreate, UserUpdate
+
+def get_user(db: Session, user_id: int) -> Optional[User]:
+    return db.query(User).filter(User.id == user_id).first()
+
+def get_user_by_email(db: Session, email: str) -> Optional[User]:
+    return db.query(User).filter(User.email == email).first()
+
+def create_user(db: Session, *, user_in: UserCreate) -> User:
+    hashed_password = get_password_hash(user_in.password)
+    db_user = User(
+        email=user_in.email,
+        hashed_password=hashed_password,
+        full_name=user_in.full_name,
+        role=user_in.role,
+        is_active=user_in.is_active
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+```
+
+```python
+# /db/crud/crud_patient.py
+
+import uuid
+from sqlalchemy.orm import Session
+from typing import Optional
+from db.models.patient import Patient
+
+def get_patient_by_uid(db: Session, *, patient_uid: uuid.UUID) -> Optional[Patient]:
+    return db.query(Patient).filter(Patient.patient_uid == patient_uid).first()
+```
+
+```python
+# /db/crud/crud_audit_log.py
+
+from sqlalchemy.orm import Session
+from db.models.audit_log import AuditLog
+from schemas.audit_log import AuditLogCreate
+
+def create_audit_log(db: Session, *, obj_in: AuditLogCreate) -> AuditLog:
+    db_obj = AuditLog(
+        user_id=obj_in.user_id,
+        patient_id=obj_in.patient_id,
+        action=obj_in.action,
+        success=obj_in.success,
+        ip_address=obj_in.ip_address,
+        details=obj_in.details,
+    )
+    db.add(db_obj)
+    db.commit()
+    db.refresh(db_obj)
+    return db_obj
+```
+
+```python
+# /db/crud/crud_clinical_note.py
+
+import uuid
+from sqlalchemy.orm import Session
+from typing import List, Optional
+
+from db.models.clinical_note import ClinicalNote
+from schemas.clinical_note import ClinicalNoteCreate, ClinicalNoteUpdate
+
+def get_note_by_uid(db: Session, *, note_uid: uuid.UUID) -> Optional[ClinicalNote]:
+    return db.query(ClinicalNote).filter(ClinicalNote.note_uid == note_uid, ClinicalNote.is_deleted == False).first()
+
+def get_notes_by_patient_id(db: Session, *, patient_id: int, skip: int = 0, limit: int = 100) -> List[ClinicalNote]:
+    return (
+        db.query(ClinicalNote)
+        .filter(ClinicalNote.patient_id == patient_id, ClinicalNote.is_deleted == False)
+        .order_by(ClinicalNote.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+def create_note(db: Session, *, note_in: ClinicalNoteCreate, patient_id: int, author_id: int) -> ClinicalNote:
+    db_note = ClinicalNote(
+        patient_id=patient_id,
+        author_id=author_id,
+        content=note_in.content
+    )
+    db.add(db_note)
+    db.commit()
+    db.refresh(db_note)
+    return db_note
+
+def update_note(db: Session, *, db_obj: ClinicalNote, obj_in: ClinicalNoteUpdate) -> ClinicalNote:
+    if obj_in.content is not None:
+        db_obj.content = obj_in.content
+    
+    db.add(db_obj)
+    db.commit()
+    db.refresh(db_obj)
+    return db_obj
+
+def soft_delete_note(db: Session, *, db_obj: ClinicalNote) -> ClinicalNote:
+    db_obj.is_deleted = True
+    db.add(db_obj)
+    db.commit()
+    db.refresh(db_obj)
+    return db_obj
+```
+
+```python
+# /api/v1/deps.py
+
+from fastapi import Depends, HTTPException, status, Request
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from pydantic import ValidationError
+from sqlalchemy.orm import Session
+
+from core.config import settings
+from core.security import ALGORITHM
+from db import crud, models, session
+from schemas.token import TokenData
+from schemas.audit_log import AuditLogCreate
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/token")
+
+def get_db():
+    yield from session.get_db()
+
+def get_current_user(
+    db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)
+) -> models.User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id_str = payload.get("sub")
-        if user_id_str is None:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        token_data = TokenData(user_id=payload.get("sub"))
+        if token_data.user_id is None:
             raise credentials_exception
-        token_data = TokenData(user_id=uuid.UUID(user_id_str))
     except (JWTError, ValidationError):
         raise credentials_exception
-
-    result = await db.execute(select(UserModel).where(UserModel.id == token_data.user_id))
-    user = result.scalar_one_or_none()
-
+    
+    user = crud.user.get_user(db, user_id=token_data.user_id)
     if user is None:
         raise credentials_exception
+    return user
 
-    return UserSchema.from_orm(user)
-
-async def get_current_active_user(current_user: UserSchema = Depends(get_current_user)) -> UserSchema:
-    """
-    Ensures the user retrieved from the token is currently active.
-    """
+def get_current_active_user(
+    current_user: models.User = Depends(get_current_user),
+) -> models.User:
     if not current_user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
     return current_user
 
-# /utils/audit.py
-# Description: Centralized service for creating audit log entries.
+def get_current_active_clinician(
+    current_user: models.User = Depends(get_current_active_user),
+) -> models.User:
+    if current_user.role not in [models.user.UserRole.CLINICIAN, models.user.UserRole.ADMIN]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The user doesn't have enough privileges",
+        )
+    return current_user
 
-from sqlalchemy.ext.asyncio import AsyncSession
-from models import AuditLog, AuditLogAction, AuditLogOutcome
-from schemas import AuditLogIn
-
-async def create_audit_log(db: AsyncSession, log_entry: AuditLogIn):
-    """
-    Creates and saves a new audit log record to the database.
-    """
-    db_log = AuditLog(
-        user_id=log_entry.user_id,
-        user_ip_address=log_entry.user_ip_address,
-        action=AuditLogAction[log_entry.action],
-        outcome=AuditLogOutcome[log_entry.outcome],
-        target_resource_type=log_entry.target_resource_type,
-        target_resource_id=log_entry.target_resource_id,
-        details=log_entry.details
+def log_audit_event(
+    request: Request,
+    db: Session,
+    user: models.User,
+    action: str,
+    success: bool,
+    patient_id: int = None,
+    details: str = None
+):
+    """Dependency to log an audit event."""
+    audit_log_in = AuditLogCreate(
+        user_id=user.id,
+        action=action,
+        success=success,
+        ip_address=request.client.host,
+        patient_id=patient_id,
+        details=details
     )
-    db.add(db_log)
-    await db.commit()
-    await db.refresh(db_log)
+    crud.audit_log.create_audit_log(db, obj_in=audit_log_in)
 
+```
 
-# /crud/labs.py
-# Description: Data access layer functions for lab results.
+```python
+# /api/v1/endpoints/auth.py
 
-import uuid
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
-from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from datetime import timedelta
 
-from models import LabPanel, User, Patient
-
-async def get_lab_panel_by_id(db: AsyncSession, panel_id: uuid.UUID) -> Optional[LabPanel]:
-    """
-
-    Retrieves a single lab panel and all its associated results.
-    """
-    result = await db.execute(
-        select(LabPanel)
-        .where(LabPanel.id == panel_id)
-        .options(selectinload(LabPanel.results))
-    )
-    return result.scalar_one_or_none()
-
-async def verify_user_access_to_patient(db: AsyncSession, user_id: uuid.UUID, patient_id: uuid.UUID) -> bool:
-    """
-    Verifies if a user has a relationship with a patient granting access.
-    This is a critical HIPAA control point. Logic here would be complex in a real system,
-    e.g., checking care teams, primary care physician links, or consent directives.
-    For this example, we'll use a simplified check.
-    """
-    # Placeholder Logic: A physician can access any patient's record.
-    # A production system would have a granular patient-provider relationship table.
-    user_result = await db.execute(select(User.role).where(User.id == user_id))
-    user_role = user_result.scalar_one_or_none()
-
-    if user_role == 'physician':
-        patient_result = await db.execute(select(Patient).where(Patient.id == patient_id))
-        if patient_result.scalar_one_or_none():
-            return True
-
-    return False
-
-# /api/v1/endpoints/labs.py
-# Description: API endpoint for retrieving patient lab results.
-
-import uuid
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from schemas import LabPanelResponse, User
-from database import get_db_session
-from security import get_current_active_user
-from crud import labs as crud_labs
-from utils.audit import create_audit_log
-from schemas import AuditLogIn
+from api.v1 import deps
+from core import security
+from core.config import settings
+from db import crud
+from schemas.token import Token
+from schemas.user import User
 
 router = APIRouter()
 
-@router.get(
-    "/patients/{patient_id}/lab-panels/{panel_id}",
-    response_model=LabPanelResponse,
-    summary="Get a specific lab result panel for a patient",
-    description="Retrieves the full details of a single lab panel, including all individual test results. Access is restricted and audited.",
-    tags=["Labs"],
-    status_code=status.HTTP_200_OK
-)
-async def get_patient_lab_panel(
-    request: Request,
-    patient_id: uuid.UUID,
-    panel_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user)
+@router.post("/token", response_model=Token)
+def login_for_access_token(
+    db: Session = Depends(deps.get_db), form_data: OAuth2PasswordRequestForm = Depends()
 ):
     """
-    Securely fetches a patient's lab panel.
-
-    - **Authentication**: Requires a valid JWT token.
-    - **Authorization**: Verifies the logged-in user has rights to access the specified patient's data.
-    - **Auditing**: Logs every access attempt, success or failure.
-    - **Data Integrity**: Returns a structured, validated response model.
+    OAuth2 compatible token login, get an access token for future requests.
     """
-    # 1. Authorization Check
-    has_access = await crud_labs.verify_user_access_to_patient(db, user_id=current_user.id, patient_id=patient_id)
-    if not has_access:
-        # Audit the failed access attempt
-        await create_audit_log(db, AuditLogIn(
-            user_id=current_user.id,
-            user_ip_address=request.client.host,
-            action="ACCESS_PHI",
-            outcome="FAILURE",
-            target_resource_type="LabPanel",
-            target_resource_id=str(panel_id),
-            details={"reason": "User not authorized for patient", "patient_id": str(patient_id)}
-        ))
+    user = crud.user.get_user_by_email(db, email=form_data.username)
+    if not user or not security.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User does not have permission to access this patient's records"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = security.create_access_token(
+        data={"sub": str(user.id)}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
-    # 2. Data Retrieval
-    lab_panel = await crud_labs.get_lab_panel_by_id(db, panel_id=panel_id)
 
-    if not lab_panel or lab_panel.patient_id != patient_id:
-        # Audit the failed access attempt
-        await create_audit_log(db, AuditLogIn(
-            user_id=current_user.id,
-            user_ip_address=request.client.host,
-            action="ACCESS_PHI",
-            outcome="FAILURE",
-            target_resource_type="LabPanel",
-            target_resource_id=str(panel_id),
-            details={"reason": "Lab panel not found for specified patient", "patient_id": str(patient_id)}
-        ))
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lab panel not found for this patient")
+@router.get("/me", response_model=User)
+def read_users_me(current_user: User = Depends(deps.get_current_active_user)):
+    """
+    Get current user.
+    """
+    return current_user
+```
 
-    # 3. Audit Successful Access
-    await create_audit_log(db, AuditLogIn(
-        user_id=current_user.id,
-        user_ip_address=request.client.host,
-        action="ACCESS_PHI",
-        outcome="SUCCESS",
-        target_resource_type="LabPanel",
-        target_resource_id=str(panel_id),
-        details={"patient_id": str(patient_id)}
-    ))
+```python
+# /api/v1/endpoints/clinical_notes.py
 
-    # 4. Return Structured Data
-    return lab_panel
+import uuid
+from typing import List
 
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from sqlalchemy.orm import Session
+
+from api.v1 import deps
+from db import crud, models
+from schemas import clinical_note
+
+router = APIRouter()
+
+@router.get("/{patient_uid}/notes", response_model=List[clinical_note.ClinicalNote])
+def read_clinical_notes(
+    *,
+    db: Session = Depends(deps.get_db),
+    request: Request,
+    patient_uid: uuid.UUID,
+    skip: int = 0,
+    limit: int = 100,
+    current_user: models.User = Depends(deps.get_current_active_clinician),
+):
+    """
+    Retrieve clinical notes for a specific patient.
+    Requires clinician-level access.
+    """
+    patient = crud.patient.get_patient_by_uid(db, patient_uid=patient_uid)
+    if not patient:
+        deps.log_audit_event(request, db, current_user, f"ACCESS_FAIL_PATIENT_NOT_FOUND", False, details=f"UID: {patient_uid}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
+    notes = crud.clinical_note.get_notes_by_patient_id(
+        db, patient_id=patient.id, skip=skip, limit=limit
+    )
+    deps.log_audit_event(request, db, current_user, "VIEW_PATIENT_NOTES", True, patient.id)
+    return notes
+
+
+@router.post("/{patient_uid}/notes", response_model=clinical_note.ClinicalNote, status_code=status.HTTP_201_CREATED)
+def create_clinical_note(
+    *,
+    db: Session = Depends(deps.get_db),
+    request: Request,
+    patient_uid: uuid.UUID,
+    note_in: clinical_note.ClinicalNoteCreate,
+    current_user: models.User = Depends(deps.get_current_active_clinician),
+):
+    """
+    Create a new clinical note for a patient.
+    """
+    patient = crud.patient.get_patient_by_uid(db, patient_uid=patient_uid)
+    if not patient:
+        deps.log_audit_event(request, db, current_user, f"CREATE_NOTE_FAIL_PATIENT_NOT_FOUND", False, details=f"UID: {patient_uid}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
+    note = crud.clinical_note.create_note(
+        db=db, note_in=note_in, patient_id=patient.id, author_id=current_user.id
+    )
+    deps.log_audit_event(request, db, current_user, "CREATE_PATIENT_NOTE", True, patient.id, details=f"Note UID: {note.note_uid}")
+    return note
+
+
+@router.put("/{patient_uid}/notes/{note_uid}", response_model=clinical_note.ClinicalNote)
+def update_clinical_note(
+    *,
+    db: Session = Depends(deps.get_db),
+    request: Request,
+    patient_uid: uuid.UUID,
+    note_uid: uuid.UUID,
+    note_in: clinical_note.ClinicalNoteUpdate,
+    current_user: models.User = Depends(deps.get_current_active_clinician),
+):
+    """
+    Update a clinical note. Only the original author can update their note.
+    """
+    note = crud.clinical_note.get_note_by_uid(db, note_uid=note_uid)
+    patient = crud.patient.get_patient_by_uid(db, patient_uid=patient_uid)
+
+    if not note or not patient or note.patient_id != patient.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Clinical note not found")
+
+    if note.author_id != current_user.id:
+        deps.log_audit_event(request, db, current_user, "UPDATE_PATIENT_NOTE_FORBIDDEN", False, patient.id, details=f"Note UID: {note.note_uid}")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to update this note")
+
+    updated_note = crud.clinical_note.update_note(db=db, db_obj=note, obj_in=note_in)
+    deps.log_audit_event(request, db, current_user, "UPDATE_PATIENT_NOTE", True, patient.id, details=f"Note UID: {note.note_uid}")
+    return updated_note
+
+
+@router.delete("/{patient_uid}/notes/{note_uid}", status_code=status.HTTP_204_NO_CONTENT)
+def soft_delete_clinical_note(
+    *,
+    db: Session = Depends(deps.get_db),
+    request: Request,
+    patient_uid: uuid.UUID,
+    note_uid: uuid.UUID,
+    current_user: models.User = Depends(deps.get_current_active_clinician),
+):
+    """
+    Soft delete a clinical note. Requires admin role or author.
+    """
+    note = crud.clinical_note.get_note_by_uid(db, note_uid=note_uid)
+    patient = crud.patient.get_patient_by_uid(db, patient_uid=patient_uid)
+    
+    if not note or not patient or note.patient_id != patient.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Clinical note not found")
+
+    if not (note.author_id == current_user.id or current_user.role == models.user.UserRole.ADMIN):
+        deps.log_audit_event(request, db, current_user, "DELETE_PATIENT_NOTE_FORBIDDEN", False, patient.id, details=f"Note UID: {note.note_uid}")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to delete this note")
+
+    crud.clinical_note.soft_delete_note(db=db, db_obj=note)
+    deps.log_audit_event(request, db, current_user, "DELETE_PATIENT_NOTE", True, patient.id, details=f"Note UID: {note.note_uid}")
+    return
+```
+
+```python
 # /api/v1/api.py
-# Description: Aggregates all API routers for version 1.
 
 from fastapi import APIRouter
-from api.v1.endpoints import labs
+
+from api.v1.endpoints import auth, clinical_notes
 
 api_router = APIRouter()
-api_router.include_router(labs.router, prefix="/labs")
+api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+api_router.include_router(clinical_notes.router, prefix="/patients", tags=["clinical-notes"])
+```
 
-
+```python
 # /main.py
-# Description: Main application entry point.
 
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from sqlalchemy.exc import SQLAlchemyError
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
+from core.config import settings
 from api.v1.api import api_router
-from database import Base, engine
+from db.base_class import Base
+from db.session import engine
+
+# Create all tables in the database
+# In a production environment with Alembic, this might be handled by migrations
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
-    title="EMR Core Services API",
-    description="Backend services for a HIPAA-compliant Electronic Medical Record system.",
-    version="1.0.0",
-    redoc_url=None, # Disable ReDoc in production
-    # swagger_ui_oauth2_redirect_url="/docs/oauth2-redirect" # Uncomment if using Swagger UI with OAuth2
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
-@app.on_event("startup")
-async def startup_event():
-    # This is for demonstration. In production, use Alembic for migrations.
-    async with engine.begin() as conn:
-        # await conn.run_sync(Base.metadata.drop_all) # Use for clean slate testing
-        await conn.run_sync(Base.metadata.create_all)
-
-# Global exception handlers
-@app.exception_handler(SQLAlchemyError)
-async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-    # Log the full exception for internal review
-    # logger.error(f"Database error on request {request.url}: {exc}")
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "An internal database error occurred."},
+# Set all CORS enabled origins
+if settings.BACKEND_CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": exc.errors()},
-    )
+app.include_router(api_router, prefix=settings.API_V1_STR)
 
-app.include_router(api_router, prefix="/api/v1")
+@app.get("/", status_code=200)
+def root():
+    """
+    Health check endpoint.
+    """
+    return {"status": "ok", "project": settings.PROJECT_NAME}
 
-@app.get("/health", status_code=status.HTTP_200_OK, tags=["System"])
-async def health_check():
-    """
-    System health check endpoint.
-    """
-    return {"status": "ok"}
 ```
