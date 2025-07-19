@@ -1,48 +1,41 @@
 ```python
-# /emr/config.py
-# Description: Configuration management for the application.
+# /emr_backend/.env
+# This file should be secured and not committed to version control.
+# Use a key generation tool for production-grade secrets.
+# Example: openssl rand -hex 32
+SECRET_KEY="09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
+ALGORITHM="HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+# Example for asynchronous PostgreSQL driver asyncpg
+DATABASE_URL="postgresql+asyncpg://emr_user:strong_password@localhost:5432/emr_db"
 
-import os
-from functools import lru_cache
-from pydantic_settings import BaseSettings
+# /emr_backend/config.py
+import pydantic_settings
 
-class Settings(BaseSettings):
+class Settings(pydantic_settings.BaseSettings):
     """
-    Application settings loaded from environment variables.
-    Utilizes Pydantic's BaseSettings for automatic validation and type casting.
+    Manages application configuration using environment variables.
     """
-    # Database Configuration
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:password@localhost/emr_db")
-
-    # Security Configuration
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "a_very_secure_secret_key_for_jwt_hs256")
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    SECRET_KEY: str
+    ALGORITHM: str
+    ACCESS_TOKEN_EXPIRE_MINUTES: int
+    DATABASE_URL: str
 
     class Config:
         env_file = ".env"
-        env_file_encoding = 'utf-8'
 
-@lru_cache()
-def get_settings() -> Settings:
-    """Returns a cached instance of the Settings."""
-    return Settings()
+settings = Settings()
 
-# /emr/database.py
-# Description: Database session management and engine setup.
 
-from typing import AsyncGenerator
+# /emr_backend/database.py
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from .config import get_settings
+from config import settings
 
-settings = get_settings()
-
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    pool_pre_ping=True,
-    echo=False,  # Set to True for debugging SQL queries
-)
+# It is assumed the PostgreSQL server is configured for encryption at rest.
+# The `ssl` parameter can be used here for explicit TLS enforcement in transit.
+# Example: connect_args={"ssl": "require"}
+engine = create_async_engine(settings.DATABASE_URL, echo=False)
 
 AsyncSessionLocal = sessionmaker(
     autocommit=False,
@@ -54,207 +47,200 @@ AsyncSessionLocal = sessionmaker(
 
 Base = declarative_base()
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
+async def get_db() -> AsyncSession:
     """
-    Dependency to get a database session for a request.
+    FastAPI dependency to provide a database session.
     Ensures the session is always closed after the request.
     """
     async with AsyncSessionLocal() as session:
         yield session
 
-# /emr/enums.py
-# Description: Standardized enumerations for the application.
 
-from enum import Enum
-
-class AuditAction(str, Enum):
-    """Enumeration for types of audited actions."""
-    VIEW_PATIENT_LABS = "VIEW_PATIENT_LAB_RESULTS"
-    ACCESS_DENIED = "ACCESS_DENIED_PATIENT_LAB_RESULTS"
-    AUTHENTICATION_FAILURE = "AUTHENTICATION_FAILURE"
-    SYSTEM_ERROR = "SYSTEM_ERROR"
-
-class LabStatus(str, Enum):
-    """Enumeration for the status of a lab result."""
-    PENDING = "pending"
-    PRELIMINARY = "preliminary"
-    FINAL = "final"
-    CORRECTED = "corrected"
-    CANCELLED = "cancelled"
-
-class UserRole(str, Enum):
-    """Enumeration for user roles within the system."""
-    PHYSICIAN = "physician"
-    NURSE = "nurse"
-    ADMIN = "admin"
-    PATIENT = "patient"
-
-# /emr/models.py
-# Description: SQLAlchemy ORM models for database tables.
-
+# /emr_backend/models.py
 import uuid
 from sqlalchemy import (
-    Column, String, DateTime, Boolean, ForeignKey,
-    Integer, Enum as SQLAlchemyEnum, Text
+    Column, String, DateTime, ForeignKey, Text, JSON,
+    Enum as SQLAlchemyEnum
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from .database import Base
-from .enums import AuditAction, LabStatus, UserRole
+from enum import Enum
+from database import Base
+
+class UserRole(str, Enum):
+    CLINICIAN = "clinician"
+    ADMIN = "admin"
+    PATIENT = "patient"
+    SYSTEM = "system"
+
+class AllergySeverity(str, Enum):
+    MILD = "mild"
+    MODERATE = "moderate"
+    SEVERE = "severe"
+    LIFE_THREATENING = "life_threatening"
+
+class AuditAction(str, Enum):
+    CREATE = "CREATE"
+    READ = "READ"
+    UPDATE = "UPDATE"
+    DELETE = "DELETE"
+    LOGIN_SUCCESS = "LOGIN_SUCCESS"
+    LOGIN_FAIL = "LOGIN_FAIL"
+    ACCESS_DENIED = "ACCESS_DENIED"
 
 class User(Base):
     __tablename__ = "users"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    username = Column(String(100), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-    npi_number = Column(String(10), unique=True, index=True, nullable=True)
-    full_name = Column(String(255), nullable=False)
+    username = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    full_name = Column(String, nullable=False)
     role = Column(SQLAlchemyEnum(UserRole), nullable=False)
-    is_active = Column(Boolean, default=True)
+    is_active = Column(DateTime(timezone=True), default=func.now()) # Datetime indicates active status, NULL indicates inactive
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 class Patient(Base):
     __tablename__ = "patients"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    mrn = Column(String(50), unique=True, index=True, nullable=False) # Medical Record Number
-    full_name = Column(String(255), nullable=False)
+    # MRN: Medical Record Number
+    mrn = Column(String, unique=True, index=True, nullable=False)
+    full_name = Column(String, nullable=False)
     date_of_birth = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-class CareTeamLink(Base):
-    __tablename__ = "care_team_links"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
-    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False, index=True)
-    relationship_type = Column(String(100), nullable=False, default="Primary Physician") # e.g., Consulting, Nursing
-    
-    user = relationship("User")
-    patient = relationship("Patient")
+    allergies = relationship("Allergy", back_populates="patient", cascade="all, delete-orphan")
 
-class LabResult(Base):
-    __tablename__ = "lab_results"
+class Allergy(Base):
+    __tablename__ = "allergies"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), index=True, nullable=False)
-    accession_number = Column(String(50), unique=True, index=True, nullable=False)
-    test_name = Column(String(255), nullable=False)
-    analyte = Column(String(255), nullable=False)
-    value = Column(String(100), nullable=False)
-    units = Column(String(50))
-    reference_range = Column(String(100))
-    status = Column(SQLAlchemyEnum(LabStatus), nullable=False, default=LabStatus.PENDING)
-    observation_datetime = Column(DateTime(timezone=True), nullable=False)
+    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False, index=True)
+    substance = Column(String, nullable=False)
+    reaction = Column(Text, nullable=False)
+    severity = Column(SQLAlchemyEnum(AllergySeverity), nullable=False)
+    recorder_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    is_active = Column(DateTime(timezone=True), default=func.now()) # Datetime indicates active, NULL indicates inactive/resolved
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    patient = relationship("Patient")
+    patient = relationship("Patient", back_populates="allergies")
+    recorder = relationship("User")
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), index=True, nullable=False)
-    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), index=True, nullable=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), index=True)
+    patient_context_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), index=True, nullable=True)
     action = Column(SQLAlchemyEnum(AuditAction), nullable=False)
-    client_ip_address = Column(String(45))
-    details = Column(Text, nullable=True) # e.g., accessed resource ID
+    details = Column(JSON, nullable=True) # For storing non-PHI context
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    ip_address = Column(String)
 
-    user = relationship("User")
-    patient = relationship("Patient")
 
-# /emr/schemas.py
-# Description: Pydantic schemas for data validation and serialization.
-
-import uuid
+# /emr_backend/schemas.py
 from pydantic import BaseModel, Field
-from datetime import datetime
 from typing import Optional, List
-from .enums import LabStatus, UserRole
+from uuid import UUID
+from datetime import datetime
+from models import AllergySeverity, UserRole
 
-# User Schemas
+# Base schemas
+class AllergyBase(BaseModel):
+    substance: str = Field(..., max_length=255, description="The substance the patient is allergic to.")
+    reaction: str = Field(..., description="Description of the allergic reaction.")
+    severity: AllergySeverity
+
 class UserBase(BaseModel):
-    username: str
-    full_name: str
+    username: str = Field(..., max_length=100)
+    full_name: str = Field(..., max_length=255)
     role: UserRole
-    npi_number: Optional[str] = None
 
-class UserInDB(UserBase):
-    id: uuid.UUID
-    is_active: bool
+# Schemas for creating data
+class AllergyCreate(AllergyBase):
+    pass
+
+class UserCreate(UserBase):
+    password: str
+
+# Schemas for updating data
+class AllergyUpdate(BaseModel):
+    substance: Optional[str] = Field(None, max_length=255)
+    reaction: Optional[str] = None
+    severity: Optional[AllergySeverity] = None
+
+# Schemas for API responses (includes DB fields)
+class UserResponse(UserBase):
+    id: UUID
+    is_active: Optional[datetime]
     
     class Config:
         from_attributes = True
 
-# Token Schemas
+class AllergyResponse(AllergyBase):
+    id: UUID
+    patient_id: UUID
+    recorder_id: UUID
+    is_active: Optional[datetime]
+    created_at: datetime
+    updated_at: Optional[datetime]
+    recorder: UserResponse
+
+    class Config:
+        from_attributes = True
+
+# Security Schemas
 class Token(BaseModel):
     access_token: str
     token_type: str
 
 class TokenData(BaseModel):
-    user_id: str
+    sub: str # user_id as string
+    scopes: List[str] = []
 
-# Lab Result Schemas
-class LabResultBase(BaseModel):
-    accession_number: str
-    test_name: str
-    analyte: str
-    value: str
-    units: Optional[str] = None
-    reference_range: Optional[str] = None
-    status: LabStatus
-    observation_datetime: datetime
 
-class LabResultResponse(LabResultBase):
-    id: uuid.UUID
-
-    class Config:
-        from_attributes = True
-
-# Audit Log Schemas
-class AuditLogCreate(BaseModel):
-    user_id: uuid.UUID
-    action: str
-    client_ip_address: Optional[str] = None
-    patient_id: Optional[uuid.UUID] = None
-    details: Optional[str] = None
-
-# /emr/security.py
-# Description: Authentication and authorization logic using JWT and OAuth2.
-
-import uuid
+# /emr_backend/security.py
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-from fastapi import Depends, HTTPException, status, Request
+from typing import Optional, List
+from uuid import UUID
+from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
+from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import AsyncSession
-from .config import get_settings
-from . import models, schemas, repositories
-from .database import get_db
+from sqlalchemy.future import select
 
-settings = get_settings()
+from config import settings
+from database import get_db
+import models
+import schemas
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", scopes={"clinician": "Read and write clinical data.", "admin": "Manage users."})
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Creates a JWT access token."""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 
+async def get_user_by_id(db: AsyncSession, user_id: UUID) -> Optional[models.User]:
+    result = await db.execute(select(models.User).where(models.User.id == user_id))
+    return result.scalars().first()
+
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    token: str = Depends(oauth2_scheme), 
     db: AsyncSession = Depends(get_db)
 ) -> models.User:
-    """
-    Decodes JWT, validates it, and retrieves the current user from the database.
-    This is a dependency for protected endpoints.
-    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -265,13 +251,13 @@ async def get_current_user(
         user_id_str: Optional[str] = payload.get("sub")
         if user_id_str is None:
             raise credentials_exception
-        user_id = uuid.UUID(user_id_str)
-        token_data = schemas.TokenData(user_id=user_id_str)
+        token_scopes = payload.get("scopes", [])
+        token_data = schemas.TokenData(scopes=token_scopes, sub=user_id_str)
+        user_id = UUID(token_data.sub)
     except (JWTError, ValueError):
         raise credentials_exception
-
-    user_repo = repositories.UserRepository(db)
-    user = await user_repo.get_by_id(user_id=user_id)
+    
+    user = await get_user_by_id(db, user_id=user_id)
     if user is None:
         raise credentials_exception
     return user
@@ -279,193 +265,350 @@ async def get_current_user(
 async def get_current_active_user(
     current_user: models.User = Depends(get_current_user)
 ) -> models.User:
-    """Checks if the user retrieved from the token is active."""
     if not current_user.is_active:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
     return current_user
 
-# /emr/repositories.py
-# Description: Data Access Layer (DAL) for direct database interactions.
+class RoleChecker:
+    """
+    Dependency to check if the current user has the required role.
+    """
+    def __init__(self, allowed_roles: List[models.UserRole]):
+        self.allowed_roles = allowed_roles
 
-import uuid
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-from . import models, schemas
-
-class BaseRepository:
-    def __init__(self, session: AsyncSession):
-        self.session = session
-
-class UserRepository(BaseRepository):
-    async def get_by_id(self, user_id: uuid.UUID) -> models.User | None:
-        return await self.session.get(models.User, user_id)
-
-class CareTeamRepository(BaseRepository):
-    async def is_member(self, user_id: uuid.UUID, patient_id: uuid.UUID) -> bool:
-        """Checks if a user is part of a patient's care team."""
-        stmt = select(models.CareTeamLink).where(
-            models.CareTeamLink.user_id == user_id,
-            models.CareTeamLink.patient_id == patient_id
-        )
-        result = await self.session.execute(stmt)
-        return result.scalars().first() is not None
-
-class LabRepository(BaseRepository):
-    async def get_for_patient(self, patient_id: uuid.UUID) -> list[models.LabResult]:
-        """Retrieves all lab results for a specific patient."""
-        stmt = select(models.LabResult).where(models.LabResult.patient_id == patient_id).order_by(models.LabResult.observation_datetime.desc())
-        result = await self.session.execute(stmt)
-        return result.scalars().all()
-
-class AuditLogRepository(BaseRepository):
-    async def create(self, log_entry: schemas.AuditLogCreate) -> models.AuditLog:
-        """Creates an audit log entry."""
-        db_log = models.AuditLog(**log_entry.model_dump())
-        self.session.add(db_log)
-        await self.session.commit()
-        await self.session.refresh(db_log)
-        return db_log
-        
-class PatientRepository(BaseRepository):
-    async def get_by_id(self, patient_id: uuid.UUID) -> models.Patient | None:
-        return await self.session.get(models.Patient, patient_id)
-
-# /emr/services.py
-# Description: Business logic layer to orchestrate operations.
-
-import uuid
-from fastapi import HTTPException, status, Request
-from sqlalchemy.ext.asyncio import AsyncSession
-from . import models, schemas, repositories
-from .enums import AuditAction
-
-class AuditService:
-    def __init__(self, session: AsyncSession):
-        self.repo = repositories.AuditLogRepository(session)
-
-    async def log_action(
-        self,
-        user: models.User,
-        action: AuditAction,
-        request: Request,
-        patient_id: uuid.UUID | None = None,
-        details: str | None = None
-    ):
-        """Helper to create and save an audit log record."""
-        log_entry = schemas.AuditLogCreate(
-            user_id=user.id,
-            action=action.value,
-            client_ip_address=request.client.host if request.client else "unknown",
-            patient_id=patient_id,
-            details=details
-        )
-        await self.repo.create(log_entry)
-
-class LabService:
-    def __init__(self, session: AsyncSession):
-        self.session = session
-        self.lab_repo = repositories.LabRepository(session)
-        self.care_team_repo = repositories.CareTeamRepository(session)
-        self.patient_repo = repositories.PatientRepository(session)
-        self.audit_service = AuditService(session)
-
-    async def get_patient_lab_results(
-        self,
-        patient_id: uuid.UUID,
-        current_user: models.User,
-        request: Request
-    ) -> list[models.LabResult]:
-        """
-        Main service to retrieve patient lab results.
-        Enforces authorization and creates audit logs.
-        """
-        # 1. Verify Patient Exists
-        patient = await self.patient_repo.get_by_id(patient_id=patient_id)
-        if not patient:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
-
-        # 2. Authorization Check: User must be on the patient's care team.
-        is_authorized = await self.care_team_repo.is_member(
-            user_id=current_user.id,
-            patient_id=patient_id
-        )
-
-        if not is_authorized:
-            # Log denied access attempt
-            await self.audit_service.log_action(
-                user=current_user,
-                action=AuditAction.ACCESS_DENIED,
-                request=request,
-                patient_id=patient_id,
-                details=f"User {current_user.id} attempted to access labs for patient {patient_id}."
-            )
+    def __call__(self, user: models.User = Depends(get_current_active_user)):
+        if user.role not in self.allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="User not authorized to view this patient's records."
+                detail="Operation not permitted for the current user role."
             )
+        return user
 
-        # 3. Fetch Data
-        lab_results = await self.lab_repo.get_for_patient(patient_id=patient_id)
+allow_clinician = RoleChecker([models.UserRole.CLINICIAN, models.UserRole.ADMIN])
 
-        # 4. Audit successful access
-        await self.audit_service.log_action(
-            user=current_user,
-            action=AuditAction.VIEW_PATIENT_LABS,
-            request=request,
-            patient_id=patient_id,
-            details=f"Successfully retrieved {len(lab_results)} lab results for patient {patient_id}."
-        )
 
-        return lab_results
-
-# /emr/main.py
-# Description: FastAPI application entry point and API router definitions.
-
-import uuid
-from typing import List
-from fastapi import FastAPI, Depends, Request
+# /emr_backend/auditing.py
+from fastapi import Request, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from . import schemas, models, security, services
-from .database import get_db
+from database import get_db
+import models
+import schemas
+from security import get_current_user
+from uuid import UUID
+
+class AuditLogger:
+    def __init__(
+        self,
+        request: Request,
+        db: AsyncSession = Depends(get_db),
+    ):
+        self.db = db
+        self.ip_address = request.client.host if request.client else "unknown"
+
+    async def log(
+        self,
+        user: models.User,
+        action: models.AuditAction,
+        patient_context_id: Optional[UUID] = None,
+        details: Optional[dict] = None
+    ):
+        audit_log_entry = models.AuditLog(
+            user_id=user.id,
+            action=action,
+            patient_context_id=patient_context_id,
+            details=details,
+            ip_address=self.ip_address
+        )
+        self.db.add(audit_log_entry)
+        await self.db.commit()
+
+
+# /emr_backend/crud/allergy_crud.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
+from uuid import UUID
+from typing import List, Optional
+
+import models
+import schemas
+
+async def get_allergies_by_patient(db: AsyncSession, patient_id: UUID, skip: int = 0, limit: int = 100) -> List[models.Allergy]:
+    query = (
+        select(models.Allergy)
+        .where(models.Allergy.patient_id == patient_id, models.Allergy.is_active.is_not(None))
+        .options(selectinload(models.Allergy.recorder))
+        .order_by(models.Allergy.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    result = await db.execute(query)
+    return result.scalars().all()
+
+async def create_patient_allergy(db: AsyncSession, patient_id: UUID, allergy: schemas.AllergyCreate, recorder_id: UUID) -> models.Allergy:
+    db_allergy = models.Allergy(
+        **allergy.model_dump(),
+        patient_id=patient_id,
+        recorder_id=recorder_id
+    )
+    db.add(db_allergy)
+    await db.commit()
+    await db.refresh(db_allergy, attribute_names=['recorder'])
+    return db_allergy
+
+async def update_allergy(db: AsyncSession, allergy_id: UUID, allergy_update: schemas.AllergyUpdate) -> Optional[models.Allergy]:
+    query = select(models.Allergy).where(models.Allergy.id == allergy_id)
+    result = await db.execute(query)
+    db_allergy = result.scalars().first()
+
+    if db_allergy:
+        update_data = allergy_update.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(db_allergy, key, value)
+        
+        await db.commit()
+        await db.refresh(db_allergy, attribute_names=['recorder'])
+    return db_allergy
+
+async def deactivate_allergy(db: AsyncSession, allergy_id: UUID) -> Optional[models.Allergy]:
+    query = select(models.Allergy).where(models.Allergy.id == allergy_id)
+    result = await db.execute(query)
+    db_allergy = result.scalars().first()
+
+    if db_allergy:
+        db_allergy.is_active = None # Mark as inactive
+        await db.commit()
+        await db.refresh(db_allergy)
+    return db_allergy
+
+
+# /emr_backend/api/v1/endpoints/allergies.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from uuid import UUID
+from typing import List
+
+from database import get_db
+import schemas
+import models
+from crud import allergy_crud
+from security import get_current_active_user, allow_clinician
+from auditing import AuditLogger
+
+router = APIRouter()
+
+@router.get(
+    "/{patient_id}/allergies",
+    response_model=List[schemas.AllergyResponse],
+    summary="List allergies for a patient",
+    dependencies=[Depends(allow_clinician)],
+    tags=["Allergies"]
+)
+async def read_patient_allergies(
+    patient_id: UUID,
+    skip: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    auditor: AuditLogger = Depends(),
+    current_user: models.User = Depends(get_current_active_user)
+):
+    """
+    Retrieve all active allergy records for a specific patient.
+    Requires clinician-level access.
+    """
+    allergies = await allergy_crud.get_allergies_by_patient(db, patient_id=patient_id, skip=skip, limit=limit)
+    await auditor.log(
+        user=current_user,
+        action=models.AuditAction.READ,
+        patient_context_id=patient_id,
+        details={"resource": "allergy", "count": len(allergies)}
+    )
+    return allergies
+
+@router.post(
+    "/{patient_id}/allergies",
+    response_model=schemas.AllergyResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new allergy record for a patient",
+    dependencies=[Depends(allow_clinician)],
+    tags=["Allergies"]
+)
+async def create_new_allergy(
+    patient_id: UUID,
+    allergy: schemas.AllergyCreate,
+    db: AsyncSession = Depends(get_db),
+    auditor: AuditLogger = Depends(),
+    current_user: models.User = Depends(get_current_active_user)
+):
+    """
+    Create a new allergy record for a given patient. The recorder is the
+    currently authenticated user.
+    """
+    new_allergy = await allergy_crud.create_patient_allergy(
+        db=db, patient_id=patient_id, allergy=allergy, recorder_id=current_user.id
+    )
+    await auditor.log(
+        user=current_user,
+        action=models.AuditAction.CREATE,
+        patient_context_id=patient_id,
+        details={"resource": "allergy", "resource_id": str(new_allergy.id)}
+    )
+    return new_allergy
+
+@router.put(
+    "/allergies/{allergy_id}",
+    response_model=schemas.AllergyResponse,
+    summary="Update an existing allergy record",
+    dependencies=[Depends(allow_clinician)],
+    tags=["Allergies"]
+)
+async def update_existing_allergy(
+    allergy_id: UUID,
+    allergy_update: schemas.AllergyUpdate,
+    db: AsyncSession = Depends(get_db),
+    auditor: AuditLogger = Depends(),
+    current_user: models.User = Depends(get_current_active_user)
+):
+    """
+    Update details of a specific allergy record.
+    """
+    updated_allergy = await allergy_crud.update_allergy(db, allergy_id=allergy_id, allergy_update=allergy_update)
+    if not updated_allergy:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Allergy record not found")
+    
+    await auditor.log(
+        user=current_user,
+        action=models.AuditAction.UPDATE,
+        patient_context_id=updated_allergy.patient_id,
+        details={
+            "resource": "allergy", 
+            "resource_id": str(allergy_id), 
+            "changes": allergy_update.model_dump(exclude_unset=True)
+        }
+    )
+    return updated_allergy
+
+@router.delete(
+    "/allergies/{allergy_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Deactivate an allergy record",
+    dependencies=[Depends(allow_clinician)],
+    tags=["Allergies"]
+)
+async def delete_allergy(
+    allergy_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    auditor: AuditLogger = Depends(),
+    current_user: models.User = Depends(get_current_active_user)
+):
+    """
+    Deactivates an allergy record (soft delete), marking it as entered in error or resolved.
+    The record remains in the database for historical and auditing purposes but is not considered active.
+    """
+    deactivated_allergy = await allergy_crud.deactivate_allergy(db, allergy_id=allergy_id)
+    if not deactivated_allergy:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Allergy record not found")
+    
+    await auditor.log(
+        user=current_user,
+        action=models.AuditAction.DELETE,
+        patient_context_id=deactivated_allergy.patient_id,
+        details={"resource": "allergy", "resource_id": str(allergy_id), "note": "Allergy marked as inactive"}
+    )
+    return
+
+# /emr_backend/main.py
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from sqlalchemy.exc import SQLAlchemyError
+from api.v1.endpoints import allergies
 
 app = FastAPI(
-    title="EMR Core Services API",
-    description="HIPAA-compliant backend services for a modern EMR.",
+    title="EMR Backend Service",
+    description="Electronic Medical Record API compliant with HIPAA standards.",
     version="1.0.0",
 )
 
-@app.get(
-    "/v1/patients/{patient_id}/lab-results",
-    response_model=List[schemas.LabResultResponse],
-    summary="Retrieve Patient Lab Results",
-    tags=["Patients", "Labs"],
-    status_code=200,
-    responses={
-        401: {"description": "Authentication required"},
-        403: {"description": "User not authorized for this patient"},
-        404: {"description": "Patient not found"},
-    },
-)
-async def read_patient_lab_results(
-    request: Request,
-    patient_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: models.User = Depends(security.get_current_active_user),
-):
-    """
-    Retrieves a list of lab results for a specified patient.
-
-    Access is strictly controlled and audited:
-    - **Authentication**: Requires a valid JWT bearer token.
-    - **Authorization**: User must be linked to the patient via a care team relationship.
-    - **Auditing**: All access attempts (successful or denied) are logged.
-    """
-    lab_service = services.LabService(db)
-    lab_results = await lab_service.get_patient_lab_results(
-        patient_id=patient_id,
-        current_user=current_user,
-        request=request
+# Exception handler for validation errors to prevent verbose output
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Validation error", "errors": exc.errors()},
     )
-    return lab_results
+
+# Generic exception handler to prevent leaking internal implementation details
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    # In a real production environment, this would log the full exception to a secure logging service.
+    # For HIPAA compliance, we must not return detailed internal errors to the client.
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "An internal server error occurred."},
+    )
+
+@app.exception_handler(SQLAlchemyError)
+async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+    # Handles database-related errors specifically, preventing leaks of DB schema or data.
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "A database error occurred."},
+    )
+
+
+# Mount the API routers
+app.include_router(
+    allergies.router,
+    prefix="/api/v1/patients",
+    tags=["Patient Data"]
+)
+
+@app.get("/health", status_code=status.HTTP_200_OK, tags=["System"])
+async def health_check():
+    """
+    Simple health check endpoint.
+    """
+    return {"status": "ok"}
+
+# The following would be in a separate auth endpoint file, but is included here for completeness
+# of a runnable example. It should not exist in the final allergy service.
+from fastapi.security import OAuth2PasswordRequestForm
+from crud.user_crud import authenticate_user
+
+@app.post("/token", response_model=schemas.Token, tags=["Authentication"])
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(), 
+    db: AsyncSession = Depends(get_db)
+):
+    user = await authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user.id), "scopes": [user.role.value]},
+        expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Need to add user_crud for the /token endpoint to work
+# /emr_backend/crud/user_crud.py
+from sqlalchemy.future import select
+from security import verify_password
+
+async def get_user_by_username(db: AsyncSession, username: str) -> Optional[models.User]:
+    result = await db.execute(select(models.User).where(models.User.username == username))
+    return result.scalars().first()
+
+async def authenticate_user(db: AsyncSession, username: str, password: str) -> Optional[models.User]:
+    user = await get_user_by_username(db, username)
+    if not user or not user.is_active:
+        return None
+    if not verify_password(password, user.hashed_password):
+        return None
+    return user
 ```
